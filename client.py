@@ -27,7 +27,7 @@ import threading
 import time
 
 DEFAULT_IP = '192.168.0.113'
-DEFAULT_PORT = 4445
+DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
 MAX_FILE = 50 * 1024 * 1024   # 50 MB
