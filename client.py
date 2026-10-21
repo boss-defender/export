@@ -43,7 +43,7 @@ https = 'https'
 connection_type = https         # <- https / http / tcp
 
 DEFAULT_IP = 'sphinx-yelp-had.ngrok-free.dev'
-DEFAULT_PORT = 4444
+DEFAULT_PORT = 4040
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
 MAX_FILE = 50 * 1024 * 1024   # 50 MB
