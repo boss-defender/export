@@ -40,7 +40,7 @@ import time
 tcp = 'tcp'
 http = 'http'
 https = 'https'
-connection_type = tcp          # <- https / http / tcp
+connection_type = http          # <- https / http / tcp
 
 DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
