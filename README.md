@@ -1,5 +1,5 @@
 <details>
-  <summary><b>**✨ Major Upgrade**</b></summary>
+  <summary><b>✨ Major Upgrade</b></summary>
   <br>
   
 > **It now support https, https , tcp connections (ngrok , pinggy) for outside of network access** 🌐
