@@ -50,7 +50,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = '192.168.0.113'
+DEFAULT_IP = 'https://cbegd-103-55-145-174.free.pinggy.net'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
