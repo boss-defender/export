@@ -50,7 +50,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://dcxtm-103-230-104-31.free.pinggy.net'
+DEFAULT_IP = 'https://vpimt-103-55-145-187.free.pinggy.net'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
