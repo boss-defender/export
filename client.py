@@ -42,8 +42,8 @@ http = 'http'
 https = 'https'
 connection_type = https         # <- https / http / tcp
 
-DEFAULT_IP = 'rhaem-103-55-145-184.free.pinggy.net'
-DEFAULT_PORT = 443
+DEFAULT_IP = 'https://bmtoy-103-55-145-173.run.pinggy-free.link'
+DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
 MAX_FILE = 50 * 1024 * 1024   # 50 MB
