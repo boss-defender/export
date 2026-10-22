@@ -50,7 +50,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://cbegd-103-55-145-174.free.pinggy.net'
+DEFAULT_IP = 'https://nhjmo-103-55-145-173.run.pinggy-free.link'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
