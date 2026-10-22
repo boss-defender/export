@@ -1,6 +1,10 @@
-## ✨ Major Upgrade
+<details>
+  <summary><b>**✨ Major Upgrade**</b></summary>
+  <br>
+  
+> **It now support https, https , tcp connections (ngrok , pinggy) for outside of network access** 🌐
 
-**It now support https, https , tcp connections (ngrok , pinggy) for outside of network access** 🌐
+</details>
 
 ***
 
