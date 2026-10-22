@@ -4,55 +4,6 @@
 
 ***
 
-## 📋 Table of Contents
-*(Click on any title below to jump directly to that section)*
-
-*   [✨ Major Upgrade](#-major-upgrade)
-*   [👾 Malwares & Connection Guidelines](#-malwares--connection-guidelines)
-    *   [🔗 Details Here (Pinggy/Ngrok Guide)](#details-here-pinggyngrok-guide)
-*   [⚙️ System Compatibility & Issues](#-system-compatibility--issues)
-*   [🛠️ Fix Freezed Controller Issue](#-fix-freezed-controller-issue)
-*   [⚠️ Key Warnings & Instructions](#-key-warnings--instructions)
-*   [💻 For Windows Only](#-for-windows-only)
-*   [🤖 Future Update with AI](#-future-update-with-ai)
-    *   [🧠 AI Prompt Template](#ai-prompt-template)
-*   [✨ Features Overview](#-features-overview)
-*   [🎯 Session Management](#-session-management)
-    *   [➡️ To List Sessions](#to-list-sessions)
-    *   [🔄 To Change Session](#to-change-session)
-    *   [🔁 To List Again](#to-list-again)
-*   [🎬 Core Functionalities](#-core-functionalities)
-*   [🧪 One Time Test Only](#-one-time-test-only)
-*   [🛡️ Permanent Hack Setup](#-permanent-hack-setup)
-*   [🟢 Foreground Session (Visible)](#-foreground-session-visible)
-*   [👻 Background Session (Hidden)](#-background-session-hidden)
-*   [🧩 Dependency Problem & Installation](#-dependency-problem--installation)
-    *   [✅ Required Packages](#required-packages)
-*   [🗑️ Removal Guides](#-removal-guides)
-    *   [💨 Easiest Removal Guide (Recommended)](#easiest-removal-guide-recommended)
-    *   [🔬 Detection & Removal Guide (Not Recommended)](#detection--removal-guide-not-recommended)
-        *   [⚡ Quick removal (when the client is still running)](#quick-removal-when-the-client-is-still-running)
-        *   [🐧 Linux (systemd)](#linux-systemd)
-            *   [🔍 What to look for](#what-to-look-for)
-            *   [🛑 Remove — user service](#remove--user-service)
-            *   [👑 Remove — system service](#remove--system-service)
-            *   [🔪 Stop a running copy](#stop-a-running-copy)
-        *   [🪟 Windows](#windows)
-            *   [🔎 What to look for](#what-to-look-for)
-            *   [🧹 Remove (cmd.exe)](#remove-cmdexe)
-            *   [🛑 Stop a running copy (PowerShell)](#stop-a-running-copy-powershell)
-        *   [🔄 Self-copying variant (`Visible-Background-Process`)](#self-copying-variantvisible-background-process)
-            *   [🗺️ Platform Artifacts Table](#platform-artifacts-table)
-            *   [🐧 Linux — remove](#linux--remove)
-            *   [🪟 Windows — remove (cmd.exe)](#windows--remove-cmdexe)
-            *   [🛑 Stop & Delete Copy](#stop-delete-copy)
-        *   [✅ General Checklist (this class of tool)](#general-checklist-this-class-of-tool)
-*   [📝 Notes](#notes)
-
-***
-
----
-
 ## 👾 Malwares & Connection Guidelines
 **Attacker should change its ip address in client.py before put it in victim pc** 📍
 
