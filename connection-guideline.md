@@ -52,8 +52,15 @@ Uses the SSH client already built into Windows 10+, macOS and Linux (Termux: `pk
 ### 🔹 TCP tunnel (fastest detection, about 3 s heartbeats)
 **Sender machine:**
 ```bash
-ssh -p 443 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R0:localhost:4444 tcp@free.pinggy.io
+ssh -p 443 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R0:localhost:4444 tcp@a.pinggy.io -T
 ```
+or,
+```bash
+ssh -p 443 -R0:localhost:4444 tcp@a.pinggy.io -T
+```
+
+**You can use tcp@free.pinggy.io instead of tcp@a.pinggy.io**
+
 Pinggy prints something like `tcp://abcde.a.free.pinggy.link:41234`.
 
 **Receiver**: paste it exactly:
@@ -64,8 +71,16 @@ DEFAULT_IP = 'tcp://abcde.a.free.pinggy.link:41234'
 ### 🔹 HTTP / HTTPS tunnel
 **Sender machine** (no `tcp@`):
 ```bash
-ssh -p 443 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R0:localhost:4444 free.pinggy.io -T
+ssh -p 443 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R0:localhost:4444 a.pinggy.io -T
 ```
+or,
+
+```bash
+ssh -p 443 -R0:localhost:4444 a.pinggy.io -T
+```
+
+**You can use free.pinggy.io instead of a.pinggy.io**
+
 Pinggy prints two URLs, e.g. `http://abcd-12-34-56-78.run.pinggy-free.link` and `https://abcd-12-34-56-78.run.pinggy-free.link`.
 
 **Receiver**: paste either one (HTTPS recommended):
