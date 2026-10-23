@@ -8,6 +8,7 @@
 
 import atexit
 import base64
+import codecs
 import contextlib
 import errno
 import hashlib
@@ -50,16 +51,20 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://pjxqe-103-230-106-21.free.pinggy.net'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
-MAX_FILE = 50 * 1024 * 1024   # 50 MB
 MAX_MSG = 96 * 1024 * 1024    # sanity bound for one protocol message
+TRANSFER_CHUNK = 1024 * 1024   # streamed file bytes carried by one JSON message
+MAX_TRANSFER_CHUNK = 4 * 1024 * 1024   # receiver-side sanity bound only
+TRANSFER_ENTRY_BATCH = 4096    # huge folder manifests are streamed in batches
+TRANSFER_ENTRY_BYTES = 4 * 1024 * 1024   # ... and by encoded size, not only count
+MAX_CAPTURE_BYTES = 256 * 1024 * 1024  # only a screenshot helper's output
 CONNECTION_TYPE = str(os.environ.get('TUNNEL_TYPE') or connection_type).strip().lower()
 VALID_CONNECTION_TYPES = ('auto', 'tcp', 'http', 'https')
 HTTP_HANDSHAKE_TIMEOUT = 10    # seconds for HTTP headers / TLS handshake
-HTTP_SEND_STALL_TIMEOUT = 10   # tolerate a slow-but-moving mobile link
+HTTP_SEND_STALL_TIMEOUT = 30   # tolerate a slow-but-moving mobile link
 HTTP_MAX_HEADER = 32 * 1024    # reject an endless response header
 HTTP_MAX_LINE = 4096           # one chunk-size/trailer line
 HTTP_MAX_CHUNK = MAX_MSG       # one HTTP chunk cannot claim unlimited memory
@@ -70,24 +75,29 @@ CMON_MARKER_VALUE = '1'
 CMON_VERSION = '2'
 CMON_USER_AGENT = 'cmon-client/2'
 CMON_WS_PROTOCOL = 'cmon.v1'
-CMON_WS_MAX_FRAME = 512 * 1024
+CMON_WS_MAX_FRAME = 1024 * 1024
 CMON_WS_PING = 20.0
 CMON_WS_DEAD = 65.0
+# Streaming HTTP has no protocol ping.  A one-byte chunk with the harmless
+# "cmon-ping" extension keeps ngrok/Pinggy from expiring an idle request and
+# is stripped by the tunnel reader before the application sees it.
+CMON_HTTP_PING = 20.0
+CMON_HTTP_DEAD = 125.0
 TUNNEL_PROBE_TIMEOUT = 12.0
-HALF_UP_BATCH = 256 * 1024    # public tunnels may cap/buffer big POST bodies
-HALF_UP_TIMEOUT = 30          # seconds for one /up body through a slow tunnel
+HALF_UP_BATCH = 1024 * 1024   # fewer round trips; still small for public tunnels
+HALF_UP_TIMEOUT = 120         # seconds for one /up body through a slow tunnel
 CMON_TRANSPORT_CACHE = {'key': None, 'kind': None}
 CMON_TRANSPORT_LOCK = threading.Lock()
 MAX_OUTPUT = 8 * 1024 * 1024  # keep this much output; a flood is cut off, not killed
 SCREEN_SIZE = (960, 540)      # screen share frame size (width, height)
 SCREEN_JPEG_QUALITY = 70      # JPEG quality for streamed frames
 SCREENSHOT_JPEG_QUALITY = 85  # JPEG quality for one-shot screenshots
-SCREEN_SEND_TIMEOUT = 5       # seconds a send may stall before we give up
+SCREEN_SEND_TIMEOUT = 30      # seconds a send may stall before we give up
 SEND_TIMEOUT = 2              # seconds one blocking send() may park in the kernel
-SEND_CHUNK = 256 * 1024       # write in bounded pieces so a stuck peer can't park a thread
-RECV_STALL_TIMEOUT = 30       # seconds a *partially read* message may stall before reconnect
-MIN_TRANSFER_RATE = 64 * 1024 # bytes/second a whole transfer must average
-TRANSFER_GRACE = 60           # seconds of allowance on top of size / MIN_TRANSFER_RATE
+SEND_CHUNK = 512 * 1024       # write in bounded pieces so a stuck peer can't park a thread
+SOCKET_BUFFER = 4 * 1024 * 1024   # kernel TCP/socketpair buffers (file-share tuning)
+RECV_CHUNK = 1024 * 1024      # one recv() may hand over this much data
+RECV_STALL_TIMEOUT = 300      # only a genuinely stuck peer is disconnected
 KEEPALIVE_IDLE = 5            # seconds of silence before TCP keepalive probes start
 KEEPALIVE_INTERVAL = 3        # seconds between keepalive probes
 KEEPALIVE_COUNT = 3           # failed probes before the connection is declared dead
@@ -100,6 +110,40 @@ def _quiet_flags():
     if os.name == 'nt':
         return {'creationflags': CREATE_NO_WINDOW}
     return {}
+
+
+def _silence_console():
+    """Make this client produce absolutely no console output.
+
+    The client is a remote agent: every useful message travels over the
+    protocol to controller.py.  Redirect the process's real stdout and stderr
+    file descriptors to the null device, not only Python's print functions, so
+    tracebacks, library warnings, helper-process noise and platform messages
+    cannot leak to the terminal either.  Network traffic, the interactive
+    shell's PTY and captured command output are unaffected.
+    """
+    try:
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        for fd in (1, 2):
+            try:
+                os.dup2(null_fd, fd)
+            except OSError:
+                pass
+    finally:
+        if null_fd > 2:
+            try:
+                os.close(null_fd)
+            except OSError:
+                pass
+    # Keep the TextIOWrapper objects coherent for any later .flush() call.
+    for name in ('stdout', 'stderr'):
+        try:
+            getattr(sys, name).flush()
+        except Exception:
+            pass
 
 
 def _harden_console():
@@ -392,6 +436,14 @@ def _tune_socket(sock):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError:
         pass
+    # Large kernel buffers keep a WAN/tunnel link full even when the peer is a
+    # little late reading.  The reference file-share project uses 4 MB; the old
+    # default (~64 KB) throttled every transfer over a high-latency tunnel.
+    for option in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, option, SOCKET_BUFFER)
+        except OSError:
+            pass
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except OSError:
@@ -461,7 +513,7 @@ def recv_exact(conn, n, stall=False, deadline=None):
             readable, _, _ = select.select([conn], [], [], timeout)
             if not readable:
                 return None
-        chunk = conn.recv(min(n, 262144))
+        chunk = conn.recv(min(n, RECV_CHUNK))
         if not chunk:
             return None
         chunks.append(chunk)
@@ -477,7 +529,7 @@ MAX_DEFERRED = 32               # bound queued requests so a slow command cannot
 MAX_DEFERRED_BYTES = 128 * 1024 * 1024
 
 
-def _send_chunked(conn, payload):
+def _send_chunked(conn, payload, stall_timeout=None, deadline=None):
     """sendall() in bounded chunks, but judge a peer by *progress*.
 
     A single sendall() of a 50 MB file could park a thread until TCP gives up
@@ -486,12 +538,16 @@ def _send_chunked(conn, payload):
     because one window took a couple of seconds. Here each send timeout only
     counts as "no progress"; a peer that is draining bytes (even slowly) keeps
     going, while one that accepts nothing for SCREEN_SEND_TIMEOUT is dropped.
+
+    Shell output passes a larger stall timeout because a terminal may print a
+    huge burst while a tunnel is briefly busy; one 2-second kernel timeout is
+    never a reason to tear down an interactive session.
     """
+    stall_timeout = SCREEN_SEND_TIMEOUT if stall_timeout is None else stall_timeout
     view = memoryview(payload)
     last_progress = time.time()
-    total_deadline = time.time() + TRANSFER_GRACE + len(payload) / float(MIN_TRANSFER_RATE)
     while view:
-        if time.time() > total_deadline:
+        if deadline is not None and time.time() > deadline:
             raise OSError('send timed out: transfer made too little progress')
         try:
             sent = conn.send(view[:SEND_CHUNK])
@@ -501,11 +557,24 @@ def _send_chunked(conn, payload):
             view = view[sent:]
             last_progress = time.time()
             continue
-        if time.time() - last_progress > SCREEN_SEND_TIMEOUT:
+        if time.time() - last_progress > stall_timeout:
             raise OSError('send stalled: controller stopped reading')
         # SO_SNDTIMEO already waited; this only prevents a hot spin on a
         # platform where send returns 0 instead of raising.
         time.sleep(0.02)
+
+
+def _send_shell_output(conn, data):
+    """Send raw terminal output without letting a momentary tunnel stall kill
+    the shell. Returns False only when the peer is genuinely gone."""
+    if not data:
+        return True
+    try:
+        _send_chunked(conn, data, stall_timeout=30,
+                      deadline=time.time() + 300 + len(data) / 16384.0)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def send_msg(conn, obj):
@@ -514,7 +583,7 @@ def send_msg(conn, obj):
     A screen share runs in its own thread, so two threads can be sending at
     the same time: without the lock their 4-byte length headers and payloads
     would interleave and desync the whole protocol."""
-    payload = json.dumps(obj).encode('utf-8')
+    payload = json.dumps(obj, separators=(',', ':')).encode('utf-8')
     # One buffer under the lock: if this fails part-way the connection is
     # retired; the controller must never interpret the next message as the
     # tail of a previous one.
@@ -595,19 +664,18 @@ def _defer_message(msg):
     return True
 
 
-def recv_msg(conn):
+def recv_msg(conn, deadline=None):
     try:
-        header = recv_exact(conn, 4)
+        header = recv_exact(conn, 4, deadline=deadline)
         if header is None:
             return None
         size = int.from_bytes(header, 'big')
         if size > MAX_MSG:              # desynced/garbage stream - reconnect
             return None
-        # A 50 MB body is allowed a generous but finite total budget: a peer
-        # that trickles 1 byte per 29 s cannot hold a worker forever. The
-        # existing per-recv stall timeout still catches a full freeze.
-        body_deadline = time.time() + TRANSFER_GRACE + size / float(MIN_TRANSFER_RATE)
-        payload = recv_exact(conn, size, stall=True, deadline=body_deadline)
+        # Only the caller's absolute deadline (tunnel handshakes) bounds a
+        # message.  File transfers are not cancelled by a throughput guess;
+        # the controller decides when a transfer stops.
+        payload = recv_exact(conn, size, stall=True, deadline=deadline)
         if payload is None:
             return None
         msg = json.loads(payload.decode('utf-8'))
@@ -616,6 +684,663 @@ def recv_msg(conn):
         # Deeply nested JSON raises RecursionError, which is a RuntimeError -
         # without catching it here the whole client exited on a bad message.
         return None
+
+
+_WINDOWS_RESERVED_NAMES = (
+    {'CON', 'PRN', 'AUX', 'NUL'}
+    | {'COM{}'.format(i) for i in range(1, 10)}
+    | {'LPT{}'.format(i) for i in range(1, 10)})
+
+
+def _safe_transfer_rel(value):
+    """Normalize a remote path so it can never escape the destination.
+
+    Mirrors the controller's sanitizer.  Backslashes become separators,
+    absolute prefixes are stripped, ".." is rejected, Windows-invalid
+    characters and device names/ADS colons are rewritten.  Returns a
+    POSIX-style relative path.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.replace('\\', '/').replace('\x00', '')
+    if value.startswith('/'):
+        value = value.lstrip('/')
+    parts = []
+    for part in value.split('/'):
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            return None
+        cleaned = []
+        for char in part:
+            if char in '<>:"|?*' or ord(char) < 32 or char == '\x7f':
+                cleaned.append('_')
+            else:
+                cleaned.append(char)
+        part = ''.join(cleaned).rstrip(' .')
+        if not part:
+            continue
+        if part.split('.', 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+            part = '_' + part
+        if len(part) > 240:
+            return None
+        parts.append(part)
+    if not parts:
+        return None
+    result = '/'.join(parts)
+    return result if len(result) <= 3000 else None
+
+
+def _safe_join_under(base, rel):
+    """Join a sanitized path and refuse to traverse an existing symlink."""
+    current = base
+    parts = rel.split('/')
+    for index, part in enumerate(parts):
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            raise OSError('refusing to write through symlink: {}'.format(current))
+        last = index == len(parts) - 1
+        if not last:
+            if os.path.exists(current):
+                if not os.path.isdir(current):
+                    raise OSError('not a directory: {}'.format(current))
+            else:
+                os.mkdir(current)
+    return current
+
+
+def _scan_transfer_tree(path, top_name=None, cancel=None):
+    """Build the manifest for a file/folder this client will upload.
+
+    Returns None if ``cancel`` is set while walking a large tree.  The
+    controller is the only side that can cancel; the client only obeys.
+    """
+    def stopped():
+        return cancel is not None and cancel.is_set()
+
+    if stopped():
+        return None
+    source = os.path.abspath(os.path.expanduser(path))
+    warnings = []
+    if os.path.islink(source):
+        raise OSError('symbolic links are not sent; use the real folder')
+    if os.path.isfile(source):
+        info = os.stat(source)
+        root = _safe_transfer_rel(top_name or os.path.basename(source))
+        if not root:
+            raise OSError('the file name is not safe to send')
+        return {'source': source, 'kind': 'file', 'root': root,
+                'entries': [],
+                'files': [(root, source, int(info.st_size),
+                           stat.S_IMODE(info.st_mode))],
+                'total_files': 1, 'total_bytes': info.st_size,
+                'warnings': warnings}
+    if not os.path.isdir(source):
+        raise OSError('not a regular file or folder')
+    root = _safe_transfer_rel(top_name or os.path.basename(source.rstrip(
+        os.sep))) or 'upload'
+    entries = []
+    files = []
+    seen = set()
+    total_files = 0
+    total_bytes = 0
+    for base, dirnames, filenames in os.walk(source, followlinks=False):
+        if stopped():
+            return None
+        rel_base = os.path.relpath(base, source)
+        rel_parent = None if rel_base == '.' else _safe_transfer_rel(rel_base)
+        if rel_base != '.' and not rel_parent:
+            # The parent was already skipped; do not send its descendants.
+            warnings.append('skipped unsafe folder {}'.format(rel_base))
+            dirnames[:] = []
+            continue
+        kept = []
+        for name in sorted(dirnames):
+            full = os.path.join(base, name)
+            if os.path.islink(full):
+                warnings.append('skipped symlink {}'.format(full))
+                continue
+            rel = _safe_transfer_rel(
+                name if rel_parent is None else rel_parent + '/' + name)
+            if not rel:
+                warnings.append('skipped unsafe folder {}'.format(full))
+                continue
+            if rel in seen:
+                warnings.append('skipped colliding folder {}'.format(full))
+                continue
+            seen.add(rel)
+            entries.append({'path': rel, 'kind': 'dir'})
+            kept.append(name)
+        dirnames[:] = kept
+        for name in sorted(filenames):
+            if stopped():
+                return None
+            full = os.path.join(base, name)
+            if os.path.islink(full):
+                warnings.append('skipped symlink {}'.format(full))
+                continue
+            try:
+                info = os.lstat(full)
+            except OSError as e:
+                warnings.append('skipped {}: {}'.format(full, e))
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                warnings.append('skipped special file {}'.format(full))
+                continue
+            rel = _safe_transfer_rel(
+                name if rel_parent is None else rel_parent + '/' + name)
+            if not rel:
+                warnings.append('skipped unsafe name {}'.format(full))
+                continue
+            if rel in seen:
+                warnings.append('skipped colliding file {}'.format(full))
+                continue
+            seen.add(rel)
+            mode = stat.S_IMODE(info.st_mode)
+            entries.append({'path': rel, 'kind': 'file',
+                            'size': int(info.st_size), 'mode': mode})
+            files.append((rel, full, int(info.st_size), mode))
+            total_files += 1
+            total_bytes += int(info.st_size)
+    if stopped():
+        return None
+    return {'source': source, 'kind': 'dir', 'root': root, 'entries': entries,
+            'files': files, 'total_files': total_files,
+            'total_bytes': total_bytes, 'warnings': warnings}
+
+
+OUTGOING_TRANSFERS = {}
+OUTGOING_LOCK = threading.Lock()
+
+
+def _outgoing_key(req_id):
+    return req_id if _valid_req_id(req_id) else None
+
+
+def _outgoing_cancel(req_id):
+    """Ask a running download worker to stop before its next chunk."""
+    key = _outgoing_key(req_id)
+    if key is None:
+        return False
+    with OUTGOING_LOCK:
+        event = OUTGOING_TRANSFERS.get(key)
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+def _abort_outgoing_transfers():
+    """Signal every download worker; the socket may be gone already."""
+    with OUTGOING_LOCK:
+        events = list(OUTGOING_TRANSFERS.values())
+        OUTGOING_TRANSFERS.clear()
+    for event in events:
+        event.set()
+
+
+def _start_download_transfer(conn, req_id, real_path):
+    """Run a streamed download off the read loop so cancel stays responsive."""
+    key = _outgoing_key(req_id)
+    cancel = threading.Event()
+    if key is not None:
+        with OUTGOING_LOCK:
+            old = OUTGOING_TRANSFERS.get(key)
+            if old is not None:
+                old.set()
+            OUTGOING_TRANSFERS[key] = cancel
+
+    def worker():
+        try:
+            _download_transfer(conn, req_id, real_path, cancel)
+        except Exception:
+            # A send/read failure has desynchronized or closed this link; the
+            # main loop will see EOF and reconnect.  Never print a traceback
+            # from a background transfer.
+            pass
+        finally:
+            if key is not None:
+                with OUTGOING_LOCK:
+                    if OUTGOING_TRANSFERS.get(key) is cancel:
+                        del OUTGOING_TRANSFERS[key]
+
+    threading.Thread(target=worker, name='download-transfer',
+                     daemon=True).start()
+
+
+def _entry_batches(entries):
+    """Yield manifest batches bounded by both item count and rough bytes."""
+    batch = []
+    size = 0
+    for entry in entries:
+        try:
+            item_size = len(entry.get('path') or '') + 96
+        except Exception:
+            item_size = 128
+        if batch and (len(batch) >= TRANSFER_ENTRY_BATCH
+                      or size + item_size > TRANSFER_ENTRY_BYTES):
+            yield batch
+            batch = []
+            size = 0
+        batch.append(entry)
+        size += item_size
+    if batch:
+        yield batch
+
+
+def _download_transfer(conn, req_id, real_path, cancel=None):
+    """Stream any file or folder to the controller.
+
+    Every file uses this path, so file size is not capped.  The controller
+    writes each file to a temporary name and atomically replaces the
+    destination only after size and SHA-256 match.  No complete file is held
+    in memory on either side.  Runs in a worker thread: the main read loop
+    stays free to receive a cancellation (`stop`/Ctrl+Z) while this runs.
+    """
+    def canceled():
+        return cancel is not None and cancel.is_set()
+
+    def stop_early():
+        try:
+            send_msg(conn, {'type': 'transfer_abort', 'id': req_id,
+                            'reason': 'canceled by the controller'})
+            send_msg(conn, {'type': 'transfer_end', 'id': req_id})
+        except OSError:
+            pass
+
+    if cancel is not None and cancel.is_set():
+        stop_early()
+        return
+    try:
+        plan = _scan_transfer_tree(real_path, cancel=cancel)
+    except Exception as e:
+        send_msg(conn, {'type': 'error', 'id': req_id,
+                        'data': 'download failed: {}'.format(e)})
+        return
+    if plan is None or canceled():
+        stop_early()
+        return
+    entries = plan.get('entries') or []
+    # Stream unusually large manifests in batches: no count limit and no
+    # single protocol message big enough to exhaust a phone's memory.
+    # Always use transfer_entries batches, so the begin message stays small
+    # regardless of how many files or how long the paths are.
+    stream_entries = bool(entries)
+    send_msg(conn, {'type': 'transfer_begin', 'id': req_id,
+                    'direction': 'download', 'kind': plan['kind'],
+                    'root': plan['root'],
+                    'entries': [] if stream_entries else entries,
+                    'entries_streamed': stream_entries,
+                    'total_files': plan['total_files'],
+                    'total_bytes': plan['total_bytes']})
+    received = 0
+    try:
+        if stream_entries:
+            for batch in _entry_batches(entries):
+                if canceled():
+                    stop_early()
+                    return
+                send_msg(conn, {'type': 'transfer_entries', 'id': req_id,
+                                'entries': batch})
+        for rel, source, size, mode in plan.get('files', []):
+            if canceled():
+                stop_early()
+                return
+            send_msg(conn, {'type': 'transfer_file_begin', 'id': req_id,
+                            'path': rel, 'size': size, 'mode': mode})
+            digest = hashlib.sha256()
+            sent = 0
+            try:
+                with open(source, 'rb') as f:
+                    while True:
+                        if canceled():
+                            stop_early()
+                            return
+                        chunk = f.read(TRANSFER_CHUNK)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        sent += len(chunk)
+                        send_msg(conn, {
+                            'type': 'transfer_chunk', 'id': req_id,
+                            'data': base64.b64encode(chunk).decode('ascii')})
+                        if sent and sent % (8 * 1024 * 1024) < TRANSFER_CHUNK:
+                            send_msg(conn, {
+                                'type': 'transfer_progress', 'id': req_id,
+                                'received': received + sent,
+                                'total': plan['total_bytes']})
+            except OSError as e:
+                send_msg(conn, {'type': 'transfer_abort', 'id': req_id,
+                                'reason': 'could not read {}: {}'.format(
+                                    source, e)})
+                send_msg(conn, {'type': 'transfer_end', 'id': req_id})
+                return
+            send_msg(conn, {'type': 'transfer_file_end', 'id': req_id,
+                            'path': rel, 'size': sent,
+                            'hash': digest.hexdigest()})
+            received += sent
+        send_msg(conn, {'type': 'transfer_end', 'id': req_id})
+    except OSError:
+        # A socket error has already desynchronized the stream; let the main
+        # loop shut this link down and reconnect.
+        raise
+
+
+def _serve_download_request(conn, msg, req_id, current_dir):
+    """Answer one 'download' request.
+
+    The current controller always sets ``stream``: files of every size and
+    whole folders use the streamed protocol.  A request from an older
+    controller without that flag keeps the old single-message reply only when
+    the file is small enough for one protocol message.
+    """
+    raw_path = msg.get('path', '')
+    if not isinstance(raw_path, str):
+        send_msg(conn, {'type': 'error', 'id': req_id,
+                        'data': 'download: path must be text'})
+        return
+    path = os.path.expanduser(raw_path)
+    real_path = path if os.path.isabs(path) else os.path.join(current_dir, path)
+    try:
+        info = os.stat(real_path)
+        if (stat.S_ISDIR(info.st_mode) or msg.get('stream')
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_size > (MAX_MSG * 3) // 4):
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise OSError('not a regular file or folder')
+            _start_download_transfer(conn, req_id, real_path)
+            return
+        with open(real_path, 'rb') as f:
+            raw = f.read((MAX_MSG * 3) // 4 + 1)
+        if len(raw) > (MAX_MSG * 3) // 4:
+            _start_download_transfer(conn, req_id, real_path)
+            return
+        data = base64.b64encode(raw).decode('ascii')
+        send_msg(conn, {'type': 'file', 'id': req_id,
+                        'name': os.path.basename(real_path),
+                        'data': data})
+    except Exception as e:
+        try:
+            send_msg(conn, {'type': 'error', 'id': req_id,
+                            'data': 'download failed: {}'.format(e)})
+        except OSError:
+            pass
+
+
+class _IncomingTransfer(object):
+    """Client-side receive state for a streamed upload."""
+
+    def __init__(self, msg, current_dir):
+        self.kind = 'dir' if msg.get('kind') == 'dir' else 'file'
+        self.entries = msg.get('entries') if isinstance(msg.get('entries'), list) else []
+        try:
+            self.total_files = max(0, int(msg.get('total_files') or 0))
+        except (TypeError, ValueError):
+            self.total_files = 0
+        try:
+            self.total_bytes = max(0, int(msg.get('total_bytes') or 0))
+        except (TypeError, ValueError):
+            self.total_bytes = 0
+        self.received = 0
+        self.files_done = 0
+        self.error = ''
+        self.handle = None
+        self.tmp = None
+        self.target = None
+        self.expected_size = 0
+        self.expected_hash = ''
+        self.digest = None
+        self.mode = None
+        self.base = None
+        self.single_target = None
+        self.seen_targets = set()
+        root = _safe_transfer_rel(msg.get('root') or '')
+        if not root:
+            self.error = 'the controller sent an unsafe destination name'
+            return
+        try:
+            if self.kind == 'dir':
+                self.base = _safe_join_under(current_dir, root)
+                if not os.path.isdir(self.base):
+                    os.mkdir(self.base)
+                self.add_entries({'entries': self.entries})
+            else:
+                self.single_target = _safe_join_under(current_dir, root)
+                if os.path.isdir(self.single_target):
+                    self.error = 'destination is a folder: {}'.format(
+                        self.single_target)
+        except OSError as e:
+            self.error = str(e)
+
+    def add_entries(self, msg):
+        if self.error or self.kind != 'dir' or not self.base:
+            return
+        entries = msg.get('entries')
+        if not isinstance(entries, list):
+            return
+        try:
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get('kind') == 'dir':
+                    rel = _safe_transfer_rel(entry.get('path'))
+                    if rel:
+                        folder = _safe_join_under(self.base, rel)
+                        if not os.path.isdir(folder):
+                            os.mkdir(folder)
+        except OSError as e:
+            self.error = str(e)
+
+    def start_file(self, msg):
+        if self.error:
+            return
+        rel = _safe_transfer_rel(msg.get('path'))
+        if not rel:
+            self.error = 'the controller sent an unsafe file path'
+            return
+        try:
+            self.expected_size = max(0, int(msg.get('size') or 0))
+        except (TypeError, ValueError):
+            self.error = 'invalid file size in transfer metadata'
+            return
+        self.expected_hash = str(msg.get('hash') or '')
+        try:
+            self.mode = int(msg.get('mode') or 0) & 0o777
+        except (TypeError, ValueError):
+            self.mode = None
+        target = None
+        try:
+            if self.kind == 'file':
+                target = self.single_target
+                if target is None:
+                    raise OSError('no destination for this file')
+            else:
+                target = _safe_join_under(self.base, rel)
+            identity = os.path.normcase(os.path.abspath(target))
+            if identity in self.seen_targets:
+                self.error = 'duplicate destination path: {}'.format(rel)
+                return
+            self.seen_targets.add(identity)
+            self.target = target
+            parent = os.path.dirname(target) or os.getcwd()
+            fd, self.tmp = tempfile.mkstemp(prefix='.cmon-in-', dir=parent)
+            self.handle = os.fdopen(fd, 'wb')
+            self.digest = hashlib.sha256()
+        except OSError as e:
+            self.error = 'could not create {}: {}'.format(
+                target or rel, e)
+            self._discard_file()
+
+    def add_chunk(self, data):
+        if self.error or self.handle is None:
+            return
+        try:
+            raw = base64.b64decode(data, validate=True) if isinstance(data, str) else b''
+        except Exception:
+            self.error = 'invalid base64 in transfer'
+            self._discard_file()
+            return
+        if not raw or len(raw) > MAX_TRANSFER_CHUNK:
+            self.error = 'invalid transfer chunk size'
+            self._discard_file()
+            return
+        try:
+            self.handle.write(raw)
+            self.digest.update(raw)
+            self.received += len(raw)
+        except OSError as e:
+            self.error = 'write failed: {}'.format(e)
+            self._discard_file()
+
+    def end_file(self, msg=None):
+        if self.handle is None:
+            return
+        try:
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+        except OSError:
+            pass
+        try:
+            self.handle.close()
+        except OSError:
+            pass
+        self.handle = None
+        digest = self.digest.hexdigest() if self.digest else ''
+        ok = not self.error
+        if ok:
+            try:
+                actual = os.path.getsize(self.tmp)
+            except OSError:
+                actual = -1
+            if actual != self.expected_size:
+                ok = False
+                self.error = ('size mismatch for {} (expected {}, got {})'
+                              .format(self.target, self.expected_size, actual))
+            if ok and self.expected_hash and digest != self.expected_hash:
+                ok = False
+                self.error = 'checksum mismatch for {}'.format(self.target)
+        if ok:
+            if self.mode is not None and os.name != 'nt':
+                try:
+                    os.chmod(self.tmp, self.mode)
+                except OSError:
+                    pass            # a FAT/network mount may not support modes
+            try:
+                os.replace(self.tmp, self.target)
+                self.tmp = None
+                self.files_done += 1
+            except OSError as e:
+                ok = False
+                self.error = 'could not save {}: {}'.format(self.target, e)
+        if not ok:
+            self._discard_file()
+        self.expected_size = 0
+        self.expected_hash = ''
+        self.digest = None
+
+    def abort(self, msg):
+        if not self.error:
+            self.error = str(msg.get('reason') or 'the controller aborted the transfer')
+        self._discard_file()
+
+    def _discard_file(self):
+        if self.handle is not None:
+            try:
+                self.handle.close()
+            except OSError:
+                pass
+            self.handle = None
+        if self.tmp:
+            try:
+                os.remove(self.tmp)
+            except OSError:
+                pass
+            self.tmp = None
+        self.digest = None
+
+    def finish(self):
+        if self.handle is not None and not self.error:
+            self.error = 'the transfer ended in the middle of a file'
+        self._discard_file()
+        if not self.error:
+            if self.kind == 'file' and self.files_done != 1:
+                self.error = 'the file was not completed'
+            elif (self.kind == 'dir' and self.total_files
+                  and self.files_done != self.total_files):
+                self.error = ('upload incomplete ({} of {} files)'
+                              .format(self.files_done, self.total_files))
+        if self.error:
+            return 'error', 'upload failed: {}'.format(self.error)
+        where = self.base if self.kind == 'dir' else self.single_target
+        return ('output',
+                'Saved to {} ({} file{}, {} bytes)'.format(
+                    where, self.files_done,
+                    '' if self.files_done == 1 else 's', self.received))
+
+
+INCOMING_TRANSFERS = {}
+INCOMING_LOCK = threading.Lock()
+
+
+def _incoming_key(req_id):
+    return req_id if _valid_req_id(req_id) else None
+
+
+def _incoming_begin(msg, req_id, current_dir):
+    key = _incoming_key(req_id)
+    if key is None:
+        return
+    with INCOMING_LOCK:
+        old = INCOMING_TRANSFERS.pop(key, None)
+    if old is not None:
+        old._discard_file()
+    INCOMING_TRANSFERS[key] = _IncomingTransfer(msg, current_dir)
+
+
+def _incoming_drop(req_id):
+    key = _incoming_key(req_id)
+    if key is None:
+        return None
+    with INCOMING_LOCK:
+        return INCOMING_TRANSFERS.pop(key, None)
+
+
+def _abort_incoming_transfers():
+    with INCOMING_LOCK:
+        states = list(INCOMING_TRANSFERS.values())
+        INCOMING_TRANSFERS.clear()
+    for state in states:
+        state._discard_file()
+
+
+def _handle_transfer_message(conn, msg, req_id, current_dir):
+    """Feed one upload-protocol message to its receive state.
+
+    Called both by the idle read loop and by run_command's control-message
+    loop, so a long foreground command cannot make a background upload's
+    chunks pile up in (or overflow) the deferred-request queue."""
+    mtype = msg.get('type')
+    if mtype == 'transfer_begin':
+        _incoming_begin(msg, req_id, current_dir)
+        return
+    key = _incoming_key(req_id)
+    state = INCOMING_TRANSFERS.get(key) if key is not None else None
+    if state is None:
+        return
+    if mtype == 'transfer_entries':
+        state.add_entries(msg)
+    elif mtype == 'transfer_file_begin':
+        state.end_file()                # a previous file was truncated
+        state.start_file(msg)
+    elif mtype == 'transfer_chunk':
+        state.add_chunk(msg.get('data'))
+    elif mtype == 'transfer_file_end':
+        state.end_file(msg)
+    elif mtype == 'transfer_abort':
+        state.abort(msg)
+    elif mtype == 'transfer_end':
+        state = _incoming_drop(req_id)
+        if state is not None:
+            rtype, text = state.finish()
+            send_msg(conn, {'type': rtype, 'id': req_id, 'data': text})
 
 
 PREV_DIR = None                 # remembered so 'cd -' works like in a real shell
@@ -1081,6 +1806,10 @@ bus.signal_subscribe('org.freedesktop.portal.Desktop',
                      None, None, Gio.DBusSignalFlags.NONE, on_response)
 GLib.timeout_add_seconds(25, on_timeout)
 
+# The Screenshot portal has no cursor option (its documented options are
+# handle_token, interactive and modal).  Asking for an undocumented
+# 'cursor-mode' made some portal versions fail the whole request, so the
+# client draws the pointer itself from the live cursor position instead.
 options = {'handle_token': GLib.Variant('s', token),
            'interactive': GLib.Variant('b', interactive)}
 try:
@@ -1129,6 +1858,324 @@ def _python_with_gi():
     return found or None
 
 
+_HYPR_LAYOUT = {'stamp': 0.0, 'box': None}
+_HYPR_LOCK = threading.Lock()
+
+
+def _hyprland_layout():
+    """Bounding box (left, top, width, height) of all Hyprland monitors.
+
+    Cursor positions and monitor geometry are in the compositor's logical
+    layout coordinates, which can have negative origins when a monitor sits
+    left of or above the primary one.  Captured images always start at (0, 0)
+    of that bounding box, so the offset must be removed before scaling.
+    The layout changes rarely; cache it for a few seconds so a 5 fps stream
+    does not spawn 'hyprctl monitors' for every frame.
+    """
+    now = time.time()
+    with _HYPR_LOCK:
+        if _HYPR_LAYOUT['box'] is not None and now - _HYPR_LAYOUT['stamp'] < 5.0:
+            return _HYPR_LAYOUT['box']
+    exe = shutil.which('hyprctl')
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run([exe, '-j', 'monitors'], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=1.5)
+        monitors = json.loads(proc.stdout.decode('utf-8', 'replace') or '[]')
+    except Exception:
+        monitors = None
+    box = None
+    if isinstance(monitors, list):
+        lefts, tops, rights, bottoms = [], [], [], []
+        for monitor in monitors:
+            try:
+                x = int(monitor['x'])
+                y = int(monitor['y'])
+                w = int(monitor['width'])
+                h = int(monitor['height'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            lefts.append(x)
+            tops.append(y)
+            rights.append(x + w)
+            bottoms.append(y + h)
+        if lefts:
+            left, top = min(lefts), min(tops)
+            box = (left, top, max(rights) - left, max(bottoms) - top)
+    with _HYPR_LOCK:
+        _HYPR_LAYOUT['stamp'] = now
+        _HYPR_LAYOUT['box'] = box
+    return box
+
+
+def _hyprland_pointer(image_size):
+    """Hyprland cursor position mapped into the captured image."""
+    exe = shutil.which('hyprctl')
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run([exe, 'cursorpos'], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=1.0)
+    except Exception:
+        return None
+    match = re.search(r'(-?\d+)\s*,\s*(-?\d+)',
+                      proc.stdout.decode('ascii', 'replace'))
+    if not match:
+        return None
+    x, y = int(match.group(1)), int(match.group(2))
+    width, height = image_size
+    box = _hyprland_layout()
+    if box is None:
+        # Single-monitor layout without a usable monitor list: grim's own
+        # coordinates are already image coordinates there.
+        if 0 <= x < width and 0 <= y < height:
+            return float(x), float(y)
+        return None
+    left, top, span_x, span_y = box
+    if span_x <= 0 or span_y <= 0:
+        return None
+    px = (x - left) * width / float(span_x)
+    py = (y - top) * height / float(span_y)
+    if 0 <= px < width and 0 <= py < height:
+        return px, py
+    return None
+
+
+def _x11_pointer(image_size):
+    """X11 pointer via libX11 (no xdotool dependency) mapped to the image.
+
+    XQueryPointer reports root-window coordinates.  ImageGrab and the X11
+    capture tools grab the root window, so a scaled image needs the root
+    dimensions to convert.  Works on a real X11 session and in a VMware/X11
+    guest; under Wayland it only sees XWayland and is therefore not used.
+    """
+    try:
+        import ctypes
+        import ctypes.util
+        name = ctypes.util.find_library('X11')
+        if not name:
+            return None
+        x11 = ctypes.CDLL(name)
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XQueryPointer.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint)]
+        x11.XQueryPointer.restype = ctypes.c_int
+        x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XDisplayWidth.restype = ctypes.c_int
+        x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XDisplayHeight.restype = ctypes.c_int
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay.restype = ctypes.c_int
+    except Exception:
+        return None
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return None
+    try:
+        root = x11.XDefaultRootWindow(display)
+        root_ret = ctypes.c_ulong()
+        child_ret = ctypes.c_ulong()
+        root_x = ctypes.c_int()
+        root_y = ctypes.c_int()
+        win_x = ctypes.c_int()
+        win_y = ctypes.c_int()
+        mask = ctypes.c_uint()
+        if not x11.XQueryPointer(display, root, ctypes.byref(root_ret),
+                                 ctypes.byref(child_ret),
+                                 ctypes.byref(root_x), ctypes.byref(root_y),
+                                 ctypes.byref(win_x), ctypes.byref(win_y),
+                                 ctypes.byref(mask)):
+            return None
+        span_x = x11.XDisplayWidth(display, 0)
+        span_y = x11.XDisplayHeight(display, 0)
+        if span_x <= 0 or span_y <= 0:
+            return None
+        width, height = image_size
+        px = root_x.value * width / float(span_x)
+        py = root_y.value * height / float(span_y)
+        if 0 <= px < width and 0 <= py < height:
+            return px, py
+    except Exception:
+        return None
+    finally:
+        try:
+            x11.XCloseDisplay(display)
+        except Exception:
+            pass
+    return None
+
+
+def _macos_pointer(image_size):
+    """Quartz pointer (no pyautogui needed), with pyautogui as a fallback.
+
+    CGEventGetLocation returns global display coordinates in the same
+    top-left-origin space as CGDisplayBounds.  Retina screenshots are in
+    pixels while Quartz reports logical points, so the target image size
+    provides the scale.
+    """
+    import ctypes
+
+    def quartz():
+        cg = ctypes.CDLL(
+            '/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+
+        class CGPoint(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
+
+        class CGSize(ctypes.Structure):
+            _fields_ = [('width', ctypes.c_double),
+                        ('height', ctypes.c_double)]
+
+        class CGRect(ctypes.Structure):
+            _fields_ = [('origin', CGPoint), ('size', CGSize)]
+
+        cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+        cg.CGEventCreate.restype = ctypes.c_void_p
+        cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+        cg.CGEventGetLocation.restype = CGPoint
+        cg.CGEventRelease.argtypes = [ctypes.c_void_p]
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+        cg.CGDisplayBounds.restype = CGRect
+        event = cg.CGEventCreate(None)
+        if not event:
+            return None
+        try:
+            point = cg.CGEventGetLocation(event)
+        finally:
+            cg.CGEventRelease(event)
+        bounds = cg.CGDisplayBounds(cg.CGMainDisplayID())
+        if bounds.size.width <= 0 or bounds.size.height <= 0:
+            return None
+        return (point.x, point.y, bounds.origin.x, bounds.origin.y,
+                bounds.size.width, bounds.size.height)
+
+    position = None
+    try:
+        position = quartz()
+    except Exception:
+        position = None
+    if position is None:
+        try:
+            import pyautogui
+            x, y = pyautogui.position()
+            screen_w, screen_h = pyautogui.size()
+            if screen_w and screen_h:
+                position = (x, y, 0, 0, screen_w, screen_h)
+        except Exception:
+            position = None
+    if position is None:
+        return None
+    x, y, left, top, span_x, span_y = position
+    width, height = image_size
+    px = (x - left) * width / float(span_x)
+    py = (y - top) * height / float(span_y)
+    if 0 <= px < width and 0 <= py < height:
+        return px, py
+    return None
+
+
+def _cursor_hotspot(image_size):
+    """Return the pointer's position in captured-image coordinates, or None.
+
+    Normal screenshots rarely include the cursor.  That is especially visible
+    when the controller watches a VMware guest: the guest pointer is drawn by
+    the guest OS, not by the host compositor, so it cannot be captured even
+    though it moves on screen.  We draw it ourselves from the live position.
+    """
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return None
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+
+            class POINT(ctypes.Structure):
+                _fields_ = [('x', wintypes.LONG), ('y', wintypes.LONG)]
+
+            point = POINT()
+            user32 = ctypes.windll.user32
+            if not user32.GetCursorPos(ctypes.byref(point)):
+                return None
+            left = user32.GetSystemMetrics(76)       # SM_XVIRTUALSCREEN
+            top = user32.GetSystemMetrics(77)        # SM_YVIRTUALSCREEN
+            span_x = user32.GetSystemMetrics(78)     # SM_CXVIRTUALSCREEN
+            span_y = user32.GetSystemMetrics(79)     # SM_CYVIRTUALSCREEN
+            if span_x <= 0 or span_y <= 0:
+                return None
+            x = (point.x - left) * width / float(span_x)
+            y = (point.y - top) * height / float(span_y)
+            if 0 <= x < width and 0 <= y < height:
+                return x, y
+            return None
+        if sys.platform == 'darwin':
+            return _macos_pointer(image_size)
+        if sys.platform.startswith('linux'):
+            if os.environ.get('WAYLAND_DISPLAY'):
+                # Hyprland exposes the global cursor position; GNOME Wayland
+                # and most other compositors do not.  grim -c / Spectacle -p
+                # cover those where the compositor can paint the pointer.
+                return _hyprland_pointer(image_size)
+            return _x11_pointer(image_size)
+    except Exception:
+        pass
+    return None
+
+
+_CAPTURE_HAS_CURSOR = False
+
+
+def _draw_cursor_overlay(img):
+    """Draw a high-contrast pointer so screen shares show mouse movement."""
+    if _CAPTURE_HAS_CURSOR:
+        # screencapture -C, GNOME Shell and Spectacle -p already painted the
+        # pointer; drawing ours too would show two cursors.  grim -c and the
+        # XDG portal do not reliably include it (Hyprland's grim ignores the
+        # flag), so those capture paths leave this False and are overlaid.
+        return img
+    try:
+        position = _cursor_hotspot(img.size)
+        if position is None:
+            return img
+        from PIL import Image, ImageDraw
+        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        x, y = position
+        # A small, recognisable arrow.  Keep it inside the frame at the edges
+        # (the hotspot still points at the real cursor position).  Scale it a
+        # little on very large captures so it stays visible in a thumbnail.
+        scale = max(1.0, min(img.width / 1366.0, 2.0))
+        x = min(max(0, int(round(x))), max(0, img.width - 2))
+        y = min(max(0, int(round(y))), max(0, img.height - 2))
+        points = [(x, y),
+                  (x + int(17 * scale), y + int(15 * scale)),
+                  (x + int(9 * scale), y + int(16 * scale)),
+                  (x + int(13 * scale), y + int(25 * scale)),
+                  (x + int(8 * scale), y + int(27 * scale)),
+                  (x + int(4 * scale), y + int(18 * scale)),
+                  (x, y + int(23 * scale))]
+        # White fill with a black border: visible on both dark and light
+        # desktops (including a mostly white Windows PowerShell window).
+        draw.polygon(points, fill=(255, 255, 255, 245),
+                     outline=(0, 0, 0, 255), width=2)
+        img.paste(overlay, (0, 0), overlay)
+    except Exception:
+        pass
+    return img
+
+
 def grab_screen():
     """Take one screenshot from wherever this client runs.
 
@@ -1168,11 +2215,11 @@ def grab_screen():
             info = os.lstat(tmp)
             if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
                 raise RuntimeError('capture produced no regular output')
-            if info.st_size > MAX_FILE:
+            if info.st_size > MAX_CAPTURE_BYTES:
                 raise RuntimeError('capture output is too large')
             with open(tmp, 'rb') as f:
-                data = f.read(MAX_FILE + 1)
-            if len(data) > MAX_FILE:
+                data = f.read(MAX_CAPTURE_BYTES + 1)
+            if len(data) > MAX_CAPTURE_BYTES:
                 raise RuntimeError('capture output is too large')
             return _load(data)
         finally:
@@ -1192,11 +2239,11 @@ def grab_screen():
             info = os.lstat(tmp)
             if not stat.S_ISREG(info.st_mode):
                 raise RuntimeError('capture did not produce a regular file')
-            if info.st_size <= 0 or info.st_size > MAX_FILE:
+            if info.st_size <= 0 or info.st_size > MAX_CAPTURE_BYTES:
                 raise RuntimeError('capture produced an invalid file size')
             with open(tmp, 'rb') as f:
-                data = f.read(MAX_FILE + 1)
-            if len(data) > MAX_FILE:
+                data = f.read(MAX_CAPTURE_BYTES + 1)
+            if len(data) > MAX_CAPTURE_BYTES:
                 raise RuntimeError('capture file is too large')
             return _load(data)
         finally:
@@ -1209,7 +2256,7 @@ def grab_screen():
         tmp = os.path.join(tmpdir, 'shot.jpg')
         exe = shutil.which('screencapture') or '/usr/sbin/screencapture'
         try:
-            proc = subprocess.run([exe, '-x', '-m', '-t', 'jpg', tmp],
+            proc = subprocess.run([exe, '-x', '-C', '-m', '-t', 'jpg', tmp],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                   timeout=15)
             if proc.returncode != 0 or not os.path.exists(tmp):
@@ -1218,11 +2265,11 @@ def grab_screen():
             info = os.lstat(tmp)
             if not stat.S_ISREG(info.st_mode):
                 raise RuntimeError('capture did not produce a regular file')
-            if info.st_size <= 0 or info.st_size > MAX_FILE:
+            if info.st_size <= 0 or info.st_size > MAX_CAPTURE_BYTES:
                 raise RuntimeError('capture produced an invalid file size')
             with open(tmp, 'rb') as f:
-                data = f.read(MAX_FILE + 1)
-            if len(data) > MAX_FILE:
+                data = f.read(MAX_CAPTURE_BYTES + 1)
+            if len(data) > MAX_CAPTURE_BYTES:
                 raise RuntimeError('capture file is too large')
             return _load(data)
         finally:
@@ -1280,31 +2327,45 @@ def grab_screen():
     def from_gnome_shell():
         """Older GNOME Shell screenshot API (works up to GNOME 40; modern
         GNOME refuses third-party callers, which is why the portal is first).
-        gdbus replies with (success, filename) - it does not write to a path
-        we choose, so it must be parsed, not passed to from_file."""
+
+        The method is Screenshot(include_cursor, flash, filename): the third
+        argument is required, and omitting it made gdbus fail with an
+        invalid-arguments error on every GNOME version.  We pass a private
+        path (true also draws the pointer) and read that file."""
         exe = shutil.which('gdbus')
         if not exe:
             raise RuntimeError('gdbus is not installed (glib2 package)')
-        proc = subprocess.run(
-            [exe, 'call', '--session', '--dest', 'org.gnome.Shell.Screenshot',
-             '--object-path', '/org/gnome/Shell/Screenshot', '--method',
-             'org.gnome.Shell.Screenshot.Screenshot', 'false', 'false'],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
-        if proc.returncode != 0:
-            detail = proc.stderr.decode('utf-8', 'replace').strip()
-            raise RuntimeError(detail.splitlines()[-1] if detail else
-                               'exit status {}'.format(proc.returncode))
-        out = proc.stdout.decode('utf-8', 'replace').strip()
-        match = re.search(r"'([^']+)'", out)
-        if not out.startswith('(true') or match is None:
-            raise RuntimeError('refused: {}'.format(out[:160] or 'no reply'))
-        path = match.group(1)
+        tmpdir = tempfile.mkdtemp(prefix='client_shot_')
+        path = os.path.join(tmpdir, 'shot.png')
         try:
+            proc = subprocess.run(
+                [exe, 'call', '--session', '--dest',
+                 'org.gnome.Shell.Screenshot', '--object-path',
+                 '/org/gnome/Shell/Screenshot', '--method',
+                 'org.gnome.Shell.Screenshot.Screenshot', 'true', 'false',
+                 path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            if proc.returncode != 0:
+                detail = proc.stderr.decode('utf-8', 'replace').strip()
+                raise RuntimeError(detail.splitlines()[-1] if detail else
+                                   'exit status {}'.format(proc.returncode))
+            out = proc.stdout.decode('utf-8', 'replace').strip()
+            if not out.startswith('(true'):
+                raise RuntimeError('refused: {}'.format(out[:160] or 'no reply'))
+            if not os.path.exists(path):
+                raise RuntimeError('GNOME Shell reported success but wrote '
+                                   'no screenshot file')
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError('capture did not produce a regular file')
+            if info.st_size <= 0 or info.st_size > MAX_CAPTURE_BYTES:
+                raise RuntimeError('capture produced an invalid file size')
             with open(path, 'rb') as f:
-                data = f.read()
+                data = f.read(MAX_CAPTURE_BYTES + 1)
+            if len(data) > MAX_CAPTURE_BYTES:
+                raise RuntimeError('capture file is too large')
         finally:
-            with contextlib.suppress(OSError):
-                os.remove(path)
+            shutil.rmtree(tmpdir, ignore_errors=True)
         return _load(data)
 
     # WAYLAND_DISPLAY is the socket a client can actually use. XDG_SESSION_TYPE
@@ -1317,8 +2378,13 @@ def grab_screen():
 
     # name -> (command line, how the picture comes back)
     helpers = {
-        'grim': (['grim', '-t', 'jpeg', '-'], from_stdout),          # wlroots Wayland (Hyprland/Sway)
-        'spectacle': (['spectacle', '-b', '-n', '-f', '-o'], from_file),    # KDE Plasma
+        # -c asks wlroots for the pointer, but Hyprland's screencopy ignores
+        # it, so the client must not rely on it; _CAPTURE_HAS_CURSOR stays
+        # False for grim and the pointer is drawn from hyprctl's position.
+        'grim': (['grim', '-c', '-t', 'jpeg', '-'], from_stdout),    # wlroots Wayland (Hyprland/Sway)
+        # -p / --pointer draws the pointer into Spectacle's own capture (the
+        # option GNOME's portal lacks), so no extra overlay is needed.
+        'spectacle': (['spectacle', '-b', '-n', '-f', '-p', '-o'], from_file),    # KDE Plasma
         'portal': (None, None),       # XDG portal (GNOME Wayland and a generic fallback)
         'gnome_shell': (None, None),  # pre-41 GNOME Shell API
         'magick': (_imagemagick_command() or
@@ -1330,6 +2396,8 @@ def grab_screen():
     x11_tools = {'Pillow', 'pyautogui', 'magick', 'scrot', 'maim'}
 
     def capture(name):
+        global _CAPTURE_HAS_CURSOR
+        _CAPTURE_HAS_CURSOR = False
         if name == 'Pillow':
             from PIL import ImageGrab
             if sys.platform == 'win32':
@@ -1347,16 +2415,24 @@ def grab_screen():
             import pyautogui    # NOTE: may sys.exit() on Linux without tkinter
             img = pyautogui.screenshot().convert('RGB')
         elif name == 'screencapture':
-            return from_screencapture()
+            img = from_screencapture()
+            _CAPTURE_HAS_CURSOR = True
+            return img
         elif name == 'android':
             return from_android()
         elif name == 'portal':
+            # The portal never promises a pointer; draw our own when the
+            # compositor exposes a cursor position.
             return from_portal()
         elif name == 'gnome_shell':
-            return from_gnome_shell()
+            img = from_gnome_shell()
+            _CAPTURE_HAS_CURSOR = True
+            return img
         else:
             cmd, grab = helpers[name]
             img = grab(cmd)
+            if name == 'spectacle':
+                _CAPTURE_HAS_CURSOR = True
         if wayland and name in x11_tools:
             lo, hi = img.convert('L').getextrema()
             if lo == hi:             # flat picture: not a real capture
@@ -1468,6 +2544,7 @@ def stream_screen(conn, fps=None, stop_event=None, req_id=None):
         try:
             img = grab_screen()
             img = img.resize(SCREEN_SIZE)                 # PIL resize: (width, height)
+            img = _draw_cursor_overlay(img)
             buf = io.BytesIO()
             img.save(buf, 'JPEG', quality=SCREEN_JPEG_QUALITY)
         except Exception as e:
@@ -1539,6 +2616,7 @@ def take_screenshot(conn, req_id=None):
     """Send one full-resolution screenshot as a JPEG image."""
     try:
         img = grab_screen()
+        img = _draw_cursor_overlay(img)
         buf = io.BytesIO()
         img.save(buf, 'JPEG', quality=SCREENSHOT_JPEG_QUALITY)
     except Exception as e:
@@ -1557,8 +2635,8 @@ def take_screenshot(conn, req_id=None):
 # the session ends. The main command connection keeps working meanwhile.
 # ---------------------------------------------------------------------------
 
-SHELL_CONNECT_TIMEOUT = 10      # seconds to keep retrying the controller's shell port
-SHELL_HANDSHAKE_TIMEOUT = 10    # seconds to wait for the terminal-size handshake
+SHELL_CONNECT_TIMEOUT = 25      # public tunnels may need a slower second connection
+SHELL_HANDSHAKE_TIMEOUT = 20    # seconds to wait for the terminal-size handshake
 SHELL_BUSY = threading.Lock()   # one interactive shell at a time
 SHELL_SOCK = [None]             # current shell socket, so reconnect/exit can stop it
 SHELL_THREAD = [None]           # its worker thread
@@ -1734,6 +2812,10 @@ def _shell_unix(sock, rows, cols):
         # shell still gets a prompt, echo, backspace and job control.
         os.environ['TERM'] = 'dumb'
         os.environ.pop('COLORTERM', None)
+        # Interactive Python helpers (input(), print(prompt, end='')) flush
+        # their prompt even when a Windows pipe fallback makes stdout a pipe.
+        os.environ['PYTHONUNBUFFERED'] = '1'
+        os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
         shell = _shell_executable() or os.environ.get('SHELL') or '/bin/bash'
         if not os.path.exists(shell):
             shell = '/bin/bash' if os.path.exists('/bin/bash') else '/bin/sh'
@@ -1796,8 +2878,10 @@ def _shell_unix(sock, rows, cols):
                     break
                 try:
                     if not _pty_write_all(master_fd, data):
-                        sock.sendall(b'\r\n[client] shell input dropped: '
-                                     b'the shell is not reading\r\n')
+                        if not _send_shell_output(
+                                sock, b'\r\n[client] shell input dropped: '
+                                      b'the shell is not reading\r\n'):
+                            break
                 except OSError:
                     break               # shell exited, PTY master closed
             if master_fd in readable:
@@ -1811,9 +2895,7 @@ def _shell_unix(sock, rows, cols):
                     raise
                 if not data:
                     break
-                try:
-                    sock.sendall(data)
-                except OSError:
+                if not _send_shell_output(sock, data):
                     break
     finally:
         try:
@@ -1823,29 +2905,670 @@ def _shell_unix(sock, rows, cols):
         _reap_pty_child(pid)            # bounded: never blocks forever on a stuck shell
 
 
+def _shell_child_env():
+    """Environment for the target shell and interactive programs."""
+    env = dict(os.environ)
+    env['PYTHONUNBUFFERED'] = '1'
+    env.setdefault('PYTHONIOENCODING', 'utf-8')
+    return env
+
+
+def _shell_notice(sock, text):
+    """Show a diagnostic line on the controller side of the shell channel.
+
+    A Windows client is often started hidden (pythonw / a service).  Printing
+    a fallback warning only to the client's own console made every Windows
+    shell problem invisible.  The shell channel is raw terminal data, so a
+    short CRLF-terminated notice is safe and appears above the shell prompt.
+    """
+    _send_shell_output(
+        sock, ('\r\n[client] {}\r\n'.format(text)).encode('utf-8', 'replace'))
+
+
+# A tiny, persistent helper that lives in the *pseudoconsole's* console and
+# turns a request into a real CTRL_C_EVENT.  0x03 written to ConPTY only does
+# that while the hosted program keeps ENABLE_PROCESSED_INPUT on; some
+# long-running programs turn it off.  GenerateConsoleCtrlEvent always delivers
+# the event, exactly like pressing Ctrl+C on a physical keyboard.  The helper
+# ignores Ctrl+C for itself, so repeated presses cannot kill it.
+_WINDOWS_CTRLC_HELPER = r'''
+import ctypes
+import sys
+import time
+
+k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+k32.AttachConsole.argtypes = [ctypes.c_uint32]
+k32.AttachConsole.restype = ctypes.c_int
+k32.FreeConsole.argtypes = []
+k32.FreeConsole.restype = ctypes.c_int
+k32.GenerateConsoleCtrlEvent.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+k32.GenerateConsoleCtrlEvent.restype = ctypes.c_int
+k32.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, ctypes.c_int]
+k32.SetConsoleCtrlHandler.restype = ctypes.c_int
+
+pid = int(sys.argv[1])
+k32.FreeConsole()
+attached = False
+for _ in range(100):
+    if k32.AttachConsole(pid):
+        attached = True
+        break
+    time.sleep(0.05)
+if not attached:
+    sys.exit(2)
+k32.SetConsoleCtrlHandler(None, 1)
+out = sys.stdout.buffer
+out.write(b'R\n')
+out.flush()
+while True:
+    line = sys.stdin.buffer.readline()
+    if not line:
+        break
+    if line.strip() == b'C':
+        # D = the console event was delivered, E = it was refused (the
+        # caller then falls back to writing 0x03 itself).  Stay alive after
+        # a failure so a later Ctrl+C can still be attempted.
+        if k32.GenerateConsoleCtrlEvent(0, 0):
+            out.write(b'D\n')
+        else:
+            out.write(b'E\n')
+        out.flush()
+sys.exit(0)
+'''
+
+
+class _WindowsCtrlCHelper(object):
+    """A helper process attached to the shell's console (see above)."""
+
+    def __init__(self, pid):
+        self.proc = None
+        self.ready = threading.Event()
+        self.dead = threading.Event()
+        self.lock = threading.Lock()
+        self._cond = threading.Condition()
+        self._response = None
+        try:
+            # Do NOT pass CREATE_NO_WINDOW here.  A process with a console of
+            # its own cannot AttachConsole() to the shell; the helper frees its
+            # console first, but avoiding a fresh console is more reliable and
+            # lets it attach to both a ConPTY and the hidden pipe-fallback
+            # console.  Its stdio is redirected, so it never flashes a window.
+            self.proc = subprocess.Popen(
+                [sys.executable, '-c', _WINDOWS_CTRLC_HELPER, str(pid)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0, close_fds=True)
+        except (OSError, ValueError):
+            self.dead.set()
+            self.ready.set()
+            return
+        threading.Thread(target=self._reader, name='windows-ctrlc-helper',
+                         daemon=True).start()
+
+    def _reader(self):
+        """First line R = attached; later D/E = event delivered/refused."""
+        first = True
+        try:
+            while True:
+                line = self.proc.stdout.readline()
+                if not line:
+                    break
+                tag = line.strip()
+                if first:
+                    first = False
+                    if tag == b'R':
+                        self.ready.set()
+                        continue
+                    break
+                if tag in (b'D', b'E'):
+                    with self._cond:
+                        self._response = tag
+                        self._cond.notify_all()
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self._cond:
+                self.dead.set()
+                self.ready.set()
+                self._cond.notify_all()
+
+    def send(self):
+        """Press Ctrl+C and wait for the helper's confirmation.
+
+        False means the event was not delivered (helper missing, attach
+        refused, GenerateConsoleCtrlEvent failed), so the caller writes 0x03
+        as a fallback instead of assuming success."""
+        if self.dead.is_set() or not self.ready.is_set() or self.proc is None:
+            return False
+        with self._cond:
+            self._response = None
+        with self.lock:
+            try:
+                self.proc.stdin.write(b'C\n')
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                self.dead.set()
+                return False
+        deadline = time.time() + 1.0
+        with self._cond:
+            while self._response is None and not self.dead.is_set():
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._cond.wait(remaining)
+            return self._response == b'D'
+
+    def close(self):
+        self.dead.set()
+        with self._cond:
+            self._cond.notify_all()
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.proc.terminate()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=0.5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+
+
+class _WindowsInputWriter(object):
+    """Bounded, priority-aware writer for a Windows console input stream.
+
+    WriteFile to a ConPTY input pipe is synchronous.  A program that stops
+    reading (or a huge paste that fills the console input buffer) could park
+    the old socket-reader thread forever, which also stopped Ctrl+C from being
+    seen.  All input now goes through this daemon thread.  Ctrl+C jumps ahead
+    of queued paste, and CancelSynchronousIo frees a blocked WriteFile so the
+    interrupt is delivered immediately instead of after the paste drains.
+    """
+
+    def __init__(self, write_chunk, ctrl_c, max_pending=4 * 1024 * 1024):
+        self._write_chunk = write_chunk
+        self._ctrl_c = ctrl_c
+        self._max_pending = max_pending
+        self._cond = threading.Condition()
+        self._data = bytearray()
+        self._ctrl = 0
+        self._stop = False
+        self.dropped = 0
+        self.failed = threading.Event()
+        self.thread = threading.Thread(target=self._run,
+                                       name='windows-shell-input', daemon=True)
+        self.thread.start()
+
+    def send(self, data):
+        if not data or self.failed.is_set():
+            return
+        pieces = data.split(b'\x03')
+        with self._cond:
+            for index, piece in enumerate(pieces):
+                if piece:
+                    room = max(0, self._max_pending - len(self._data))
+                    take = min(len(piece), room)
+                    if take:
+                        self._data += piece[:take]
+                    if take < len(piece):
+                        # Only the bytes that did not fit were dropped; the
+                        # old arithmetic also counted bytes that were queued.
+                        self.dropped += len(piece) - take
+                if index != len(pieces) - 1:
+                    self._ctrl = min(self._ctrl + 1, 64)
+            has_ctrl = self._ctrl > 0
+            self._cond.notify()
+        # Free a WriteFile parked in a full console buffer even when the
+        # Ctrl+C is the only pending byte (a paste that filled the buffer and
+        # then pressed Ctrl+C).  Otherwise the interrupt waits for the write.
+        if has_ctrl:
+            self._cancel_blocked_write()
+
+    def _cancel_blocked_write(self):
+        """Best effort: stop a WriteFile stuck in a full console buffer."""
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            tid = getattr(self.thread, 'native_id', None)
+            if not tid:
+                return
+            k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            k32.OpenThread.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+            k32.OpenThread.restype = wt.HANDLE
+            k32.CancelSynchronousIo.argtypes = [wt.HANDLE]
+            k32.CancelSynchronousIo.restype = wt.BOOL
+            k32.CloseHandle.argtypes = [wt.HANDLE]
+            handle = k32.OpenThread(0x0001, False, tid)   # THREAD_TERMINATE
+            if handle:
+                try:
+                    k32.CancelSynchronousIo(handle)
+                finally:
+                    k32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while not self._stop and not self._ctrl and not self._data:
+                    self._cond.wait(0.2)
+                if self._stop and not self._ctrl:
+                    return
+                if self._ctrl:
+                    self._ctrl -= 1
+                    chunk = None
+                else:
+                    chunk = bytes(self._data[:65536])
+                    del self._data[:65536]
+            try:
+                if chunk is None:
+                    ok = self._ctrl_c()
+                else:
+                    # None = the write was cancelled to deliver Ctrl+C;
+                    # that is not a failure, so just let the event go next.
+                    ok = self._write_chunk(chunk) is not False
+            except Exception:
+                ok = False
+            if not ok:
+                self.failed.set()
+                return
+
+    def close(self, wait=0.5):
+        with self._cond:
+            self._stop = True
+            self._cond.notify()
+        try:
+            self.thread.join(wait)
+        except Exception:
+            pass
+
+
+def _shell_windows_conpty(sock, rows, cols):
+    """Run PowerShell/cmd in a real Windows pseudo-console (ConPTY).
+
+    This is the Windows equivalent of a Unix PTY.  Unlike the pipe fallback,
+    the console host echoes typed characters, streams output as it is
+    produced, and turns Ctrl+C into a real console event.  The pseudo-console
+    input/output channels are synchronous, so reading always happens on its
+    own thread and writing goes through _WindowsInputWriter.
+
+    Raises RuntimeError with the failing API stage instead of returning False
+    silently: a hidden Windows client made every setup error invisible, which
+    is why a broken ConPTY quietly degraded to the non-echoing pipe fallback.
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    if not (hasattr(k32, 'CreatePseudoConsole')
+            and hasattr(k32, 'ClosePseudoConsole')
+            and hasattr(k32, 'ResizePseudoConsole')):
+        raise RuntimeError('ConPTY needs Windows 10 1809 or newer')
+
+    HANDLE = wt.HANDLE
+    DWORD = wt.DWORD
+    BOOL = wt.BOOL
+    LPVOID = ctypes.c_void_p
+    SIZE_T = ctypes.c_size_t
+    HRESULT = ctypes.c_long
+    COORD = type('COORD', (ctypes.Structure,), {
+        '_fields_': [('X', ctypes.c_short), ('Y', ctypes.c_short)]})
+    STARTUPINFO = type('STARTUPINFO', (ctypes.Structure,), {
+        '_fields_': [
+            ('cb', DWORD), ('lpReserved', wt.LPWSTR), ('lpDesktop', wt.LPWSTR),
+            ('lpTitle', wt.LPWSTR), ('dwX', DWORD), ('dwY', DWORD),
+            ('dwXSize', DWORD), ('dwYSize', DWORD),
+            ('dwXCountChars', DWORD), ('dwYCountChars', DWORD),
+            ('dwFillAttribute', DWORD), ('dwFlags', DWORD),
+            ('wShowWindow', wt.WORD), ('cbReserved2', wt.WORD),
+            ('lpReserved2', ctypes.POINTER(ctypes.c_byte)),
+            ('hStdInput', HANDLE), ('hStdOutput', HANDLE),
+            ('hStdError', HANDLE)]})
+    STARTUPINFOEX = type('STARTUPINFOEX', (ctypes.Structure,), {
+        '_fields_': [('StartupInfo', STARTUPINFO),
+                     ('lpAttributeList', LPVOID)]})
+    PROCESS_INFORMATION = type('PROCESS_INFORMATION', (ctypes.Structure,), {
+        '_fields_': [('hProcess', HANDLE), ('hThread', HANDLE),
+                     ('dwProcessId', DWORD), ('dwThreadId', DWORD)]})
+
+    k32.CreatePipe.argtypes = [ctypes.POINTER(HANDLE), ctypes.POINTER(HANDLE),
+                               LPVOID, DWORD]
+    k32.CreatePipe.restype = BOOL
+    k32.CreatePseudoConsole.argtypes = [COORD, HANDLE, HANDLE, DWORD,
+                                        ctypes.POINTER(HANDLE)]
+    k32.CreatePseudoConsole.restype = HRESULT
+    k32.ResizePseudoConsole.argtypes = [HANDLE, COORD]
+    k32.ResizePseudoConsole.restype = HRESULT
+    k32.ClosePseudoConsole.argtypes = [HANDLE]
+    k32.ClosePseudoConsole.restype = None
+    k32.InitializeProcThreadAttributeList.argtypes = [
+        LPVOID, DWORD, DWORD, ctypes.POINTER(SIZE_T)]
+    k32.InitializeProcThreadAttributeList.restype = BOOL
+    k32.UpdateProcThreadAttribute.argtypes = [
+        LPVOID, DWORD, ctypes.c_size_t, LPVOID, SIZE_T, LPVOID, LPVOID]
+    k32.UpdateProcThreadAttribute.restype = BOOL
+    k32.DeleteProcThreadAttributeList.argtypes = [LPVOID]
+    k32.DeleteProcThreadAttributeList.restype = None
+    k32.CreateProcessW.argtypes = [
+        wt.LPCWSTR, wt.LPWSTR, LPVOID, LPVOID, BOOL, DWORD, LPVOID,
+        wt.LPCWSTR, ctypes.POINTER(STARTUPINFO),
+        ctypes.POINTER(PROCESS_INFORMATION)]
+    k32.CreateProcessW.restype = BOOL
+    k32.ReadFile.argtypes = [HANDLE, LPVOID, DWORD,
+                             ctypes.POINTER(DWORD), LPVOID]
+    k32.ReadFile.restype = BOOL
+    k32.WriteFile.argtypes = [HANDLE, LPVOID, DWORD,
+                              ctypes.POINTER(DWORD), LPVOID]
+    k32.WriteFile.restype = BOOL
+    k32.TerminateProcess.argtypes = [HANDLE, ctypes.c_uint]
+    k32.TerminateProcess.restype = BOOL
+    k32.WaitForSingleObject.argtypes = [HANDLE, DWORD]
+    k32.WaitForSingleObject.restype = DWORD
+    k32.CloseHandle.argtypes = [HANDLE]
+    k32.CloseHandle.restype = BOOL
+
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+    EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+    CREATE_UNICODE_ENVIRONMENT = 0x00000400
+    ERROR_OPERATION_ABORTED = 995
+    ERROR_INSUFFICIENT_BUFFER = 122
+
+    def close(handle):
+        if handle:
+            try:
+                k32.CloseHandle(handle)
+            except Exception:
+                pass
+
+    in_read = in_write = out_read = out_write = None
+    hpc = None
+    attr_buf = None
+    si = STARTUPINFOEX()
+    pi = PROCESS_INFORMATION()
+    stage = 'starting'
+    try:
+        stage = 'CreatePipe(input)'
+        in_read, in_write = HANDLE(), HANDLE()
+        out_read, out_write = HANDLE(), HANDLE()
+        if not k32.CreatePipe(ctypes.byref(in_read), ctypes.byref(in_write),
+                              None, 0):
+            raise OSError(ctypes.get_last_error(), 'CreatePipe(input)')
+        stage = 'CreatePipe(output)'
+        if not k32.CreatePipe(ctypes.byref(out_read), ctypes.byref(out_write),
+                              None, 0):
+            raise OSError(ctypes.get_last_error(), 'CreatePipe(output)')
+        stage = 'CreatePseudoConsole'
+        hpc = HANDLE()
+        hr = k32.CreatePseudoConsole(
+            COORD(max(1, int(cols)), max(1, int(rows))),
+            in_read, out_write, 0, ctypes.byref(hpc))
+        if hr != 0:
+            raise OSError(hr, 'CreatePseudoConsole')
+
+        stage = 'InitializeProcThreadAttributeList'
+        # The attribute list is allocated separately because ctypes cannot
+        # pass a pointer-to-pointer the way InitializeProcThreadAttributeList
+        # wants.  The first call reports the required size in ERROR_INSUFFICIENT_
+        # BUFFER; that is expected, not a failure.
+        need = SIZE_T()
+        k32.InitializeProcThreadAttributeList(
+            None, 1, 0, ctypes.byref(need))
+        if need.value <= 0:
+            raise OSError(ctypes.get_last_error(),
+                          'InitializeProcThreadAttributeList(size)')
+        attr_buf = ctypes.create_string_buffer(max(1, need.value))
+        if not k32.InitializeProcThreadAttributeList(
+                ctypes.cast(attr_buf, LPVOID), 1, 0, ctypes.byref(need)):
+            raise OSError(ctypes.get_last_error(),
+                          'InitializeProcThreadAttributeList')
+        stage = 'UpdateProcThreadAttribute'
+        if not k32.UpdateProcThreadAttribute(
+                ctypes.cast(attr_buf, LPVOID), 0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                ctypes.cast(hpc, LPVOID), ctypes.sizeof(HANDLE),
+                None, None):
+            raise OSError(ctypes.get_last_error(),
+                          'UpdateProcThreadAttribute')
+
+        si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEX)
+        si.lpAttributeList = ctypes.cast(attr_buf, LPVOID)
+
+        shell = 'powershell.exe' if shutil.which('powershell.exe') else 'cmd.exe'
+        app = shutil.which(shell) or shell
+        # -NoLogo starts printing the prompt immediately.  Profiles are left
+        # enabled so aliases/functions the user relies on still exist.
+        args = ' -NoLogo' if shell.lower() == 'powershell.exe' else ''
+        cmdline = ctypes.create_unicode_buffer('"{}"{}'.format(app, args))
+        # Sorted environment: some Windows components expect that layout, and
+        # Python children still inherit PYTHONUNBUFFERED=1 / UTF-8.
+        env = _shell_child_env()
+        items = sorted(((k, v) for k, v in env.items()
+                        if k and '=' not in k), key=lambda item: item[0].upper())
+        env_block = ctypes.create_unicode_buffer(
+            '\0'.join('{}={}'.format(k, v) for k, v in items) + '\0\0')
+        stage = 'CreateProcessW'
+        if not k32.CreateProcessW(
+                app, cmdline, None, None, False,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                ctypes.cast(env_block, LPVOID), None,
+                ctypes.byref(si.StartupInfo), ctypes.byref(pi)):
+            raise OSError(ctypes.get_last_error(), 'CreateProcessW')
+        # The pseudo-console owns the child ends after process creation; only
+        # the parent ends may stay open (closing them is required to see EOF).
+        close(in_read)
+        close(out_write)
+        in_read = out_write = None
+    except Exception as exc:
+        close(in_write)
+        close(out_read)
+        close(in_read)
+        close(out_write)
+        if hpc:
+            try:
+                k32.ClosePseudoConsole(hpc)
+            except Exception:
+                pass
+        close(pi.hThread)
+        close(pi.hProcess)
+        if attr_buf is not None:
+            try:
+                k32.DeleteProcThreadAttributeList(
+                    ctypes.cast(attr_buf, LPVOID))
+            except Exception:
+                pass
+        raise RuntimeError('{}: {}'.format(stage, exc))
+
+    # The console is live.  Keep output draining on its own thread: ConPTY is
+    # a synchronous pipe, and a full output buffer while we wait for input
+    # would deadlock both the shell and this client.
+    stop = threading.Event()
+
+    def reader():
+        # Keep draining even after the session is being torn down:
+        # ClosePseudoConsole can block while output is still buffered in the
+        # pipe, so stopping this thread first would deadlock the shutdown.
+        buf = ctypes.create_string_buffer(65536)
+        try:
+            while True:
+                n = DWORD()
+                if not k32.ReadFile(out_read, buf, len(buf),
+                                    ctypes.byref(n), None):
+                    break
+                if not n.value:
+                    break
+                if not _send_shell_output(sock, buf.raw[:n.value]):
+                    break
+        finally:
+            stop.set()
+
+    def write_chunk(data):
+        view = memoryview(data)
+        while view:
+            written = DWORD()
+            if not k32.WriteFile(in_write, bytes(view), len(view),
+                                 ctypes.byref(written), None):
+                if ctypes.get_last_error() == ERROR_OPERATION_ABORTED:
+                    return None       # freed for a priority Ctrl+C
+                return False
+            if written.value <= 0:
+                return False
+            view = view[written.value:]
+        return True
+
+    helper = None
+    writer = None
+    reader_thread = threading.Thread(target=reader, name='conpty-reader',
+                                     daemon=True)
+    reader_thread.start()
+    try:
+        helper = _WindowsCtrlCHelper(pi.dwProcessId)
+
+        def ctrl_c():
+            # Prefer the real console event.  If the helper could not attach
+            # (policy/VirtualDesktop restrictions), 0x03 still works whenever
+            # the hosted program left ENABLE_PROCESSED_INPUT enabled.
+            if helper is not None and helper.send():
+                return True
+            return write_chunk(b'\x03') is not False
+
+        writer = _WindowsInputWriter(write_chunk, ctrl_c)
+        while not stop.is_set() and not writer.failed.is_set():
+            # ConPTY keeps the output pipe open after the shell exits until
+            # ClosePseudoConsole is called, so the process handle is the
+            # reliable 'exit' signal; give the reader a moment to drain the
+            # final prompt before tearing the session down.
+            try:
+                if k32.WaitForSingleObject(pi.hProcess, 0) == 0:
+                    time.sleep(0.08)
+                    stop.set()
+                    break
+            except Exception:
+                pass
+            try:
+                readable, _, _ = select.select([sock], [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            if not readable:
+                continue
+            try:
+                data = sock.recv(65536)
+            except (OSError, ConnectionError, EOFError):
+                break
+            if not data:
+                break
+            writer.send(data)
+    except Exception:
+        pass
+    finally:
+        stop.set()
+        try:
+            if writer is not None:
+                writer.close()
+        except Exception:
+            pass
+        try:
+            if helper is not None:
+                helper.close()
+        except Exception:
+            pass
+        try:
+            k32.TerminateProcess(pi.hProcess, 1)
+        except Exception:
+            pass
+        try:
+            k32.WaitForSingleObject(pi.hProcess, 1000)
+        except Exception:
+            pass
+        # Close the console before the pipe handles so ConPTY can flush its
+        # final frame without blocking on a full output buffer.
+        try:
+            k32.ClosePseudoConsole(hpc)
+        except Exception:
+            pass
+        try:
+            reader_thread.join(1.0)
+        except Exception:
+            pass
+        for handle in (in_write, out_read, pi.hThread, pi.hProcess):
+            close(handle)
+        try:
+            k32.DeleteProcThreadAttributeList(ctypes.cast(attr_buf, LPVOID))
+        except Exception:
+            pass
+    return True
+
+
 def _shell_windows(sock, rows, cols):
-    """Bridge a PowerShell/cmd console (winpty) to the controller's socket."""
+    """Bridge a PowerShell/cmd console to the controller's socket."""
+    # Prefer the built-in ConPTY bridge: it is a real terminal, so cmd.exe
+    # echoes typed characters and live output is not hidden in a pipe buffer.
+    if os.name == 'nt':
+        try:
+            _shell_windows_conpty(sock, rows, cols)
+            return
+        except Exception as exc:
+            reason = str(exc) or exc.__class__.__name__
+            print('[!] ConPTY shell failed ({}); trying pywinpty.'.format(reason))
+            _shell_notice(sock, 'ConPTY unavailable: {}'.format(reason))
     try:
         import winpty                   # pywinpty >= 3.0.5: pip install pywinpty
-    except ImportError:
-        print('[!] pywinpty is not installed - using the pipe fallback.')
+    except Exception as exc:            # ImportError, or a missing DLL/OSError
+        reason = str(exc) or exc.__class__.__name__
+        print('[!] pywinpty is unavailable ({}); using the pipe fallback.'
+              .format(reason))
+        _shell_notice(sock, 'No ConPTY/pywinpty ({}); using the limited pipe '
+                            'fallback (line input, local echo).'.format(reason))
         _shell_windows_pipes(sock)
         return
 
     shell = 'powershell.exe' if shutil.which('powershell.exe') else 'cmd.exe'
-    pty = winpty.PtyProcess.spawn(shell, dimensions=(rows, cols))
+    try:
+        try:
+            pty = winpty.PtyProcess.spawn(shell, dimensions=(rows, cols),
+                                          env=_shell_child_env())
+        except TypeError:
+            # Older pywinpty releases do not accept env=; the caller's
+            # environment is inherited in that case.
+            pty = winpty.PtyProcess.spawn(shell, dimensions=(rows, cols))
+    except Exception as exc:
+        reason = str(exc) or exc.__class__.__name__
+        print('[!] pywinpty could not start the shell ({}); using the pipe '
+              'fallback.'.format(reason))
+        _shell_notice(sock, 'pywinpty failed ({}); using the limited pipe '
+                            'fallback (line input, local echo).'.format(reason))
+        _shell_windows_pipes(sock)
+        return
 
     stop = threading.Event()
 
     def reader():
         try:
             while not stop.is_set():
-                data = pty.read()       # returns str (Unicode) in pywinpty v3+
-                if not data:            # None or empty -> EOF
+                try:
+                    data = pty.read()       # str (Unicode) in pywinpty v3+
+                except EOFError:
                     break
+                if not data:
+                    # A transient empty read must not kill output forever;
+                    # only stop when the console process itself is gone.
+                    alive = getattr(pty, 'isalive', None)
+                    try:
+                        if alive is not None and not alive():
+                            break
+                    except Exception:
+                        break
+                    time.sleep(0.01)
+                    continue
                 if isinstance(data, str):
                     data = data.encode('utf-8', 'replace')
-                sock.sendall(data)
+                if not _send_shell_output(sock, data):
+                    break
         except Exception:
             pass
         finally:
@@ -1853,105 +3576,236 @@ def _shell_windows(sock, rows, cols):
 
     threading.Thread(target=reader, daemon=True).start()
 
+    def write_chunk(data):
+        try:
+            pty.write(data.decode('utf-8', 'replace'))
+            return True
+        except (OSError, ValueError, EOFError):
+            return False
+
+    def ctrl_c():
+        # pywinpty owns a real hidden console, and 0x03 reaches it as a key.
+        return write_chunk(b'\x03')
+
+    writer = _WindowsInputWriter(write_chunk, ctrl_c)
     try:
-        while not stop.is_set():
-            readable, _, _ = select.select([sock], [], [], 0.2)
+        while not stop.is_set() and not writer.failed.is_set():
+            try:
+                readable, _, _ = select.select([sock], [], [], 0.2)
+            except (OSError, ValueError):
+                break
             if not readable:
-                continue                        # lets us notice shell exit
-            data = sock.recv(65536)
+                # Do not wait for output to notice the console exited.
+                alive = getattr(pty, 'isalive', None)
+                try:
+                    if alive is not None and not alive():
+                        break
+                except Exception:
+                    pass
+                continue
+            try:
+                data = sock.recv(65536)
+            except (OSError, ConnectionError, EOFError):
+                break
             if not data:
                 break
-            data = re.sub(br'\r(?!\n)', b'\r\n', data)   # lone \r -> \r\n
-            pty.write(data.decode('utf-8', 'replace'))
+            # Do not rewrite CR to CRLF here: the controller already sends a
+            # lone CR for Enter, and pywinpty turns that into the Enter key.
+            writer.send(data)
     except (OSError, ConnectionError, EOFError):
         pass
     finally:
         stop.set()
+        writer.close()
         try:
             pty.terminate()
         except Exception:
             pass
 
 
-def _shell_windows_pipes(sock):
-    """Fallback when pywinpty is unavailable (cmd/powershell via pipes).
+def _filter_shell_keys(text):
+    """Remove terminal escape sequences from pasted/typed pipe-fallback input.
 
-    Input goes through a bounded writer queue: a child that stops reading its
-    stdin can block only that writer, never the socket reader (which must keep
-    noticing disconnect/cancel). Excess paste is dropped and reported instead
-    of growing without limit."""
+    Returns (printable_text, unfinished_escape).  Arrow keys and function
+    keys cannot be represented in a plain pipe; forwarding their raw bytes
+    to PowerShell/cmd only inserts garbage into the command line.
+    """
+    out = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char != '\x1b':
+            out.append(char)
+            index += 1
+            continue
+        next_index = index + 1
+        if next_index >= length:
+            return ''.join(out), text[index:]
+        if text[next_index] in ('[', 'O'):
+            next_index += 1
+            while next_index < length and not ('@' <= text[next_index] <= '~'):
+                next_index += 1
+            if next_index >= length:
+                return ''.join(out), text[index:]
+            index = next_index + 1
+            continue
+        index += 2
+    return ''.join(out), ''
+
+
+def _shell_windows_pipes(sock):
+    """Line-oriented last-resort fallback when no Windows PTY exists.
+
+    A redirected cmd/PowerShell does not echo typed characters, and programs
+    that insist on a console may buffer or refuse interactive input.  This
+    mode therefore renders the typed line locally, submits complete lines on
+    Enter, streams child output immediately, and uses the console-events
+    helper for Ctrl+C (0x03 written to a pipe is not an interrupt).  ConPTY
+    and pywinpty remain the real shell implementations; this keeps the
+    session usable on locked-down systems where both are unavailable.
+    """
     shell = 'powershell.exe' if shutil.which('powershell.exe') else 'cmd.exe'
+    # A real hidden console is required for Ctrl+C: 0x03 written to a pipe is
+    # just a byte.  CREATE_NEW_CONSOLE gives the helper a console to attach to
+    # for GenerateConsoleCtrlEvent, while STARTF_USESHOWWINDOW/SW_HIDE keeps
+    # the window invisible on normal desktops and servers.
+    startupinfo = None
+    creationflags = CREATE_NO_WINDOW
+    if os.name == 'nt':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 1)
+        startupinfo.wShowWindow = getattr(subprocess, 'SW_HIDE', 0)
+        creationflags = 0x00000010          # CREATE_NEW_CONSOLE
     proc = subprocess.Popen([shell], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, bufsize=0,
                             close_fds=True,          # never inherit socket handles
-                            creationflags=CREATE_NO_WINDOW)
+                            startupinfo=startupinfo,
+                            creationflags=creationflags,
+                            env=_shell_child_env())
+
+    send_lock = threading.Lock()
+
+    def send_raw(data):
+        # Pipe-fallback output can also burst (dir /s, a long build log).
+        # Never let one temporary SO_SNDTIMEO tear the shell down.
+        with send_lock:
+            return _send_shell_output(sock, data)
+
+    stop = threading.Event()
 
     def pump():
         try:
-            while True:
-                chunk = os.read(proc.stdout.fileno(), 4096)
+            while not stop.is_set():
+                chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
                     break
-                sock.sendall(chunk)
+                send_raw(chunk)
         except OSError:
             pass
         finally:
+            stop.set()
             try:
                 sock.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
 
-    input_queue = queue.Queue(maxsize=32)   # at most ~2 MB of pending input
-    stop_writer = threading.Event()
-    input_dropped = [False]
+    threading.Thread(target=pump, name='pipe-shell-output', daemon=True).start()
 
-    def writer():
-        while not stop_writer.is_set():
+    helper = _WindowsCtrlCHelper(proc.pid)
+
+    input_queue = queue.Queue(maxsize=64)
+    dropped = [0]
+
+    def input_writer():
+        while not stop.is_set():
             try:
-                data = input_queue.get(timeout=0.2)
+                command = input_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
-            if data is None:
+            if command is None:
                 return
-            view = memoryview(data)
             try:
-                while view:
-                    if stop_writer.is_set():
-                        return
-                    written = proc.stdin.write(view)
-                    if written is None:
-                        written = len(view)
-                    if written <= 0:
-                        return
-                    view = view[written:]
+                proc.stdin.write((command + '\r\n').encode('utf-8', 'replace'))
                 proc.stdin.flush()
             except (OSError, ValueError):
+                stop.set()
                 return
 
-    threading.Thread(target=pump, daemon=True).start()
-    writer_thread = threading.Thread(target=writer, daemon=True)
+    writer_thread = threading.Thread(target=input_writer, name='pipe-shell-input',
+                                     daemon=True)
     writer_thread.start()
 
+    def echo(text):
+        try:
+            send_raw(text.encode('utf-8', 'replace'))
+        except OSError:
+            stop.set()
+
+    decoder = codecs.getincrementaldecoder('utf-8')('replace')
+    pending_escape = ''
+    line = []
+    last_was_cr = False
     try:
-        while True:
-            data = sock.recv(65536)
+        while not stop.is_set():
+            try:
+                data = sock.recv(65536)
+            except (OSError, BrokenPipeError):
+                break
             if not data:
                 break
-            data = re.sub(br'\r(?!\n)', b'\r\n', data)
-            try:
-                input_queue.put_nowait(data)
-            except queue.Full:
-                if not input_dropped[0]:
-                    input_dropped[0] = True
+            text, pending_escape = _filter_shell_keys(
+                pending_escape + decoder.decode(data))
+            for char in text:
+                if char == '\n' and last_was_cr:
+                    last_was_cr = False
+                    continue
+                last_was_cr = char == '\r'
+                if char in ('\r', '\n'):
+                    command = ''.join(line)
+                    line = []
+                    echo('\r\n')
                     try:
-                        sock.sendall(b'\r\n[client] shell input queue full; '
-                                     b'paste truncated\r\n')
-                    except OSError:
-                        break
+                        input_queue.put_nowait(command)
+                    except queue.Full:
+                        dropped[0] += 1
+                        echo('\r\n[client] input queue full; line dropped\r\n')
+                    continue
+                if char in ('\x7f', '\x08'):
+                    if line:
+                        line.pop()
+                        echo('\b \b')
+                    continue
+                if char == '\x03':
+                    line = []
+                    echo('^C\r\n')
+                    if not helper.send():
+                        # No real console event: deliver a literal ETX too;
+                        # some PowerShell hosts still see it as an interrupt.
+                        try:
+                            proc.stdin.write(b'\x03')
+                            proc.stdin.flush()
+                        except (OSError, ValueError):
+                            stop.set()
+                    continue
+                if char == '\t':
+                    # Completion needs a real console; treat Tab as spaces so
+                    # the command is still readable and executable.
+                    line.extend('    ')
+                    echo('    ')
+                    continue
+                if char < ' ':
+                    continue
+                line.append(char)
+                echo(char)
     except (OSError, BrokenPipeError):
         pass
     finally:
-        stop_writer.set()
+        stop.set()
+        try:
+            helper.close()
+        except Exception:
+            pass
         try:
             proc.kill()
         except Exception:
@@ -1972,7 +3826,6 @@ def _shell_windows_pipes(sock):
             proc.wait(timeout=0.5)
         except Exception:
             pass
-
 
 def _interactive_shell_thread(host, port, scheme='auto', token=None):
     """Background worker: run one interactive shell session for the controller."""
@@ -2344,6 +4197,12 @@ def run_command(conn, command, current_dir, req_id=None):
                     killed = True
                 else:
                     _mark_canceled(target, why)  # a queued request: skip it later
+                    key = _incoming_key(target)
+                    state = (INCOMING_TRANSFERS.get(key)
+                             if key is not None else None)
+                    if state is not None:
+                        state.abort({'reason': why})
+                    _outgoing_cancel(target)
             elif mtype == 'cmd_kill':           # older controller: stop this one
                 _kill_process(proc)
                 killed = True
@@ -2353,6 +4212,18 @@ def run_command(conn, command, current_dir, req_id=None):
                 _kill_process(proc)
                 stop = True
                 break
+            elif mtype in ('transfer_begin', 'transfer_entries',
+                           'transfer_file_begin', 'transfer_chunk',
+                           'transfer_file_end', 'transfer_abort',
+                           'transfer_end'):
+                # A background upload may run while this command does.  Feed
+                # its stream to the receive state instead of deferring chunks
+                # (the bounded queue would reject most of a large file).
+                _handle_transfer_message(conn, msg, msg.get('id'), current_dir)
+            elif mtype == 'download':
+                # Let a background download start now instead of waiting for
+                # a long command; its worker only writes to the socket.
+                _serve_download_request(conn, msg, msg.get('id'), current_dir)
             else:
                 # A request sent while this command runs (the controller can
                 # have several operations in flight now): answer it once this
@@ -3438,8 +5309,8 @@ class HttpTunnel(object):
         self._out.settimeout(1.0)
         try:
             for sock in (self._in, self._out):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER)
         except OSError:
             pass
         self._buf = bytearray(initial)
@@ -3447,6 +5318,14 @@ class HttpTunnel(object):
         self._closed = False
         self._resources_closed = False
         self._write_closed = False
+        self._last_rx = time.monotonic()
+        self._next_ping = self._last_rx + CMON_HTTP_PING
+        # A short receive timeout lets the pump send heartbeats and notice a
+        # dead proxy; socket.timeout itself is not treated as EOF.
+        try:
+            self.raw.settimeout(1.0)
+        except (AttributeError, OSError):
+            pass
         self._reader = threading.Thread(target=self._pump,
                                         name=name + '-reader', daemon=True)
         self._reader.start()
@@ -3464,9 +5343,10 @@ class HttpTunnel(object):
             if self._closed or self._write_closed:
                 raise OSError('HTTP tunnel is closed')
             try:
-                self._raw_send(('{:x}\r\n'.format(len(data))).encode('ascii'))
-                self._raw_send(data)
-                self._raw_send(b'\r\n')
+                # One write per chunk: fewer syscalls and no half-written
+                # chunk header for a slow proxy to parse.
+                header = ('{:x}\r\n'.format(len(data))).encode('ascii')
+                self._raw_send(b''.join((header, data, b'\r\n')))
             except OSError:
                 self._broken()
                 raise
@@ -3546,15 +5426,37 @@ class HttpTunnel(object):
             view = view[sent:]
             last_progress = time.time()
 
-    def _raw_read(self, n):
-        while len(self._buf) < n:
+    def _send_heartbeat(self):
+        with self._send_lock:
+            if self._closed or self._write_closed:
+                return
             try:
-                chunk = self.raw.recv(65536)
+                self._raw_send(b'1;cmon-ping\r\n \r\n')
+            except OSError:
+                self._broken()
+
+    def _read_more(self):
+        """Read one wire block, sending heartbeats while the link is idle."""
+        while True:
+            now = time.monotonic()
+            if now >= self._next_ping:
+                self._next_ping = now + CMON_HTTP_PING
+                self._send_heartbeat()
+            if now - self._last_rx > CMON_HTTP_DEAD:
+                raise OSError('HTTP tunnel peer stopped answering')
+            try:
+                chunk = self.raw.recv(RECV_CHUNK)
             except (socket.timeout, TimeoutError):
-                raise OSError('HTTP tunnel receive stalled')
+                continue
             if not chunk:
                 raise ConnectionError('HTTP tunnel closed')
+            self._last_rx = time.monotonic()
             self._buf += chunk
+            return
+
+    def _raw_read(self, n):
+        while len(self._buf) < n:
+            self._read_more()
         data = bytes(self._buf[:n])
         del self._buf[:n]
         return data
@@ -3563,13 +5465,7 @@ class HttpTunnel(object):
         while b'\r\n' not in self._buf:
             if len(self._buf) > HTTP_MAX_LINE:
                 raise OSError('HTTP chunk line is too large')
-            try:
-                chunk = self.raw.recv(65536)
-            except (socket.timeout, TimeoutError):
-                raise OSError('HTTP tunnel receive stalled')
-            if not chunk:
-                raise ConnectionError('HTTP tunnel closed')
-            self._buf += chunk
+            self._read_more()
         line, _sep, rest = self._buf.partition(b'\r\n')
         if len(line) > HTTP_MAX_LINE:
             raise OSError('HTTP chunk line is too large')
@@ -3601,9 +5497,9 @@ class HttpTunnel(object):
                 line = self._read_line()
                 if not line:
                     continue
-                size_text = line.split(b';', 1)[0].strip()
+                size_text, _sep, extensions = line.partition(b';')
                 try:
-                    size = int(size_text, 16)
+                    size = int(size_text.strip(), 16)
                 except ValueError:
                     raise OSError('invalid HTTP chunk size')
                 if size < 0 or size > HTTP_MAX_CHUNK:
@@ -3622,12 +5518,14 @@ class HttpTunnel(object):
                         if trailer_count > 128:
                             raise OSError('too many HTTP trailers')
                     break
+                heartbeat = b'cmon-ping' in extensions.lower()
                 remaining = size
                 while remaining:
-                    piece = self._raw_read(min(remaining, 65536))
+                    piece = self._raw_read(min(remaining, RECV_CHUNK))
                     if not piece:
                         raise ConnectionError('HTTP chunk ended early')
-                    self._write_local(piece)
+                    if not heartbeat:
+                        self._write_local(piece)
                     remaining -= len(piece)
                 if self._raw_read(2) != b'\r\n':
                     raise OSError('missing HTTP chunk terminator')
@@ -3681,8 +5579,8 @@ class WebSocketTunnel(object):
         self._out.settimeout(1.0)
         try:
             for sock in (self._in, self._out):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER)
         except OSError:
             pass
         self._buf = bytearray(initial)
@@ -3830,7 +5728,7 @@ class WebSocketTunnel(object):
             if now - self._last_rx > CMON_WS_DEAD:
                 raise OSError('WebSocket peer stopped answering')
             try:
-                chunk = self.raw.recv(65536)
+                chunk = self.raw.recv(RECV_CHUNK)
             except (socket.timeout, TimeoutError):
                 continue
             if not chunk:
@@ -4082,7 +5980,7 @@ class _BodyStream(object):
         self.chunked = bool(tokens and tokens[-1] == 'chunked')
         self.eof = False
 
-    def _recv(self, size=65536, timeout=None):
+    def _recv(self, size=262144, timeout=None):
         if timeout is not None:
             self.sock.settimeout(timeout)
         try:
@@ -4180,11 +6078,13 @@ class HalfTunnelClient(object):
         self._out.settimeout(1.0)
         try:
             for sock in (self._in, self._out):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER)
         except OSError:
             pass
         self.up_q = queue.Queue(maxsize=128)
+        self.up_sock = None
+        self.up_seq = 0
         self._closed = False
         self._write_closed = False
         self._resources_closed = False
@@ -4241,6 +6141,7 @@ class HalfTunnelClient(object):
             self.down_sock.close()
         except OSError:
             pass
+        self._close_up_socket()
         if self._resources_closed:
             return
         self._resources_closed = True
@@ -4293,37 +6194,92 @@ class HalfTunnelClient(object):
             except OSError:
                 pass
 
-    def _send_up(self, data):
+    def _close_up_socket(self):
+        sock = self.up_sock
+        self.up_sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _open_up_socket(self):
         sock = _connect_target(self.host, self.port)
         try:
             _tune_socket(sock)
             if self.use_tls:
                 sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
                 sock = _wrap_client_tls(sock, self.host)
-            version = 'HTTP/1.0' if (os.environ.get('CMON_FORCE_HTTP10') or '').strip() in ('1', 'true', 'yes') else 'HTTP/1.1'
-            lines = [
-                'POST /up {}'.format(version),
-                'Host: {}'.format(_host_header(self.host, self.port)),
-                'Content-Type: application/octet-stream',
-                'Content-Length: {}'.format(len(data)),
-                'Connection: close',
-                'X-CMon-Session: {}'.format(self.session_id),
-            ]
-            lines.extend(_tunnel_headers(self.host, self.token, self.role))
-            lines.extend(['', ''])
             sock.settimeout(HALF_UP_TIMEOUT)
-            sock.sendall('\r\n'.join(lines).encode('latin-1') + data)
-            head, _extra = _read_http_head(sock)
-            parts = head.split('\r\n')
-            status = parts[0].split(None, 2) if parts else []
-            if len(status) < 2 or int(status[1]) != 200:
-                raise OSError('POST /up returned {}'.format(
-                    ' '.join(status[:2]) if status else 'no response'))
-        finally:
+            return sock
+        except Exception:
             try:
                 sock.close()
             except OSError:
                 pass
+            raise
+
+    def _send_up_once(self, data, sequence):
+        if self.up_sock is None:
+            self.up_sock = self._open_up_socket()
+        sock = self.up_sock
+        version = 'HTTP/1.0' if (os.environ.get('CMON_FORCE_HTTP10') or '').strip() in ('1', 'true', 'yes') else 'HTTP/1.1'
+        lines = [
+            'POST /up {}'.format(version),
+            'Host: {}'.format(_host_header(self.host, self.port)),
+            'Content-Type: application/octet-stream',
+            'Content-Length: {}'.format(len(data)),
+            'Connection: keep-alive',
+            'X-CMon-Session: {}'.format(self.session_id),
+            'X-CMon-Up-Seq: {}'.format(sequence),
+        ]
+        lines.extend(_tunnel_headers(self.host, self.token, self.role))
+        lines.extend(['', ''])
+        sock.settimeout(HALF_UP_TIMEOUT)
+        sock.sendall('\r\n'.join(lines).encode('latin-1') + data)
+        head, extra = _read_http_head(sock)
+        parts = head.split('\r\n')
+        status = parts[0].split(None, 2) if parts else []
+        if len(status) < 2:
+            raise OSError('POST /up returned no HTTP status')
+        code = int(status[1])
+        response_version = status[0].upper()
+        response_headers = _http_headers(parts[1:])
+        try:
+            length = int(response_headers.get('content-length', '0') or 0)
+        except ValueError:
+            length = 0
+        # Consume the tiny response body so the next request on this socket
+        # starts at the right byte.  A proxy that buffered part of it leaves
+        # the rest in `extra`.
+        body = bytearray(extra[:length])
+        while len(body) < length:
+            chunk = sock.recv(min(length - len(body), 65536))
+            if not chunk:
+                raise OSError('POST /up response body ended early')
+            body += chunk
+        tokens = [item.strip().lower() for item in
+                  response_headers.get('connection', '').split(',')
+                  if item.strip()]
+        if ('close' in tokens
+                or (response_version == 'HTTP/1.0' and 'keep-alive' not in tokens)):
+            self._close_up_socket()
+        if code != 200:
+            raise OSError('POST /up returned {}'.format(' '.join(status[:2])))
+
+    def _send_up(self, data):
+        # One failed request is retried once on a fresh connection.  The
+        # sequence number makes the retry idempotent even when the first
+        # request reached the controller but its response was lost.
+        self.up_seq += 1
+        sequence = self.up_seq
+        try:
+            self._send_up_once(data, sequence)
+        except OSError:
+            self._close_up_socket()
+            if self._closed:
+                raise
+            self._send_up_once(data, sequence)
 
     def _up_loop(self):
         try:
@@ -4366,6 +6322,346 @@ class HalfTunnelClient(object):
                 self._out.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# HTTP long-poll fallback (last resort)
+#
+# Unlike /down, every response here has a finite Content-Length and the
+# request closes.  A proxy that buffers whole responses therefore delays a
+# batch but cannot hide it forever, and a buffered request body cannot block
+# a keystroke.  The controller serves it from the same bytes and offsets as
+# every other transport.
+# ---------------------------------------------------------------------------
+
+POLL_WAIT = 8.0               # controller holds an empty down request this long
+POLL_BATCH = 2 * 1024 * 1024  # one down response / upload request
+POLL_TIMEOUT = 25.0           # response timeout (wait + slow proxy)
+
+
+def _poll_request(host, port, use_tls, method, path, body=b'', timeout=POLL_TIMEOUT):
+    """One short HTTP request; returns (status, headers, body)."""
+    sock = _connect_target(host, port)
+    try:
+        _tune_socket(sock)
+        if use_tls:
+            sock.settimeout(HTTP_HANDSHAKE_TIMEOUT)
+            sock = _wrap_client_tls(sock, host)
+        version = ('HTTP/1.0' if (os.environ.get('CMON_FORCE_HTTP10')
+                                  or '').strip() in ('1', 'true', 'yes')
+                   else 'HTTP/1.1')
+        lines = [
+            '{} {} {}'.format(method, path, version),
+            'Host: {}'.format(_host_header(host, port)),
+            'Accept: */*',
+            'Content-Type: application/octet-stream',
+            'Content-Length: {}'.format(len(body)),
+            'Connection: close',
+            'Cache-Control: no-store',
+            'User-Agent: {}'.format(CMON_USER_AGENT),
+            'ngrok-skip-browser-warning: 1',
+            'X-Pinggy-No-Screen: 1',
+            'X-CMon: 1',
+        ]
+        lines.extend(['', ''])
+        sock.settimeout(timeout)
+        sock.sendall('\r\n'.join(lines).encode('latin-1') + body)
+        # The controller holds an empty down request up to POLL_WAIT before
+        # sending even the response headers, so the header timeout must cover
+        # that wait plus proxy latency (the default 10s was too tight).
+        head, extra = _read_http_head(sock, timeout=timeout)
+        parts = head.split('\r\n')
+        if not parts:
+            raise TransportNotSupported('empty poll response')
+        status = parts[0].split(None, 2)
+        if len(status) < 2:
+            raise TransportNotSupported('malformed poll status')
+        try:
+            code = int(status[1])
+        except ValueError:
+            raise TransportNotSupported('malformed poll status code')
+        headers = _http_headers(parts[1:])
+        sock.settimeout(timeout)
+        length_text = headers.get('content-length')
+        if length_text is not None:
+            try:
+                length = int(length_text)
+            except ValueError:
+                raise TransportNotSupported('bad poll Content-Length')
+            if length < 0 or length > MAX_MSG:
+                raise TransportNotSupported('poll response is too large')
+            data = bytearray(extra[:length])
+            while len(data) < length:
+                chunk = sock.recv(min(length - len(data), 262144))
+                if not chunk:
+                    raise TransportNotSupported('poll response ended early')
+                data += chunk
+            return code, headers, bytes(data)
+        # A proxy may re-chunk the response even though the controller sent a
+        # length.  Read to EOF (Connection: close), bounded to a few batches.
+        stream = _BodyStream(sock, headers, extra)
+        data = bytearray()
+        while len(data) <= POLL_BATCH * 4:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            data += chunk
+        return code, headers, bytes(data)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+class PollTunnelClient(object):
+    """Client-side socket-shaped adapter for the long-poll fallback."""
+
+    def __init__(self, host, port, use_tls, sid, role='control', token=None,
+                 initial=b''):
+        self.host = host
+        self.port = port
+        self.use_tls = use_tls
+        self.session_id = sid
+        self.role = role
+        self.token = token
+        self._in, self._out = socket.socketpair()
+        self._in.settimeout(None)
+        self._out.settimeout(1.0)
+        try:
+            for sock in (self._in, self._out):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER)
+        except OSError:
+            pass
+        self.down_pos = 0
+        self.up_seq = 0
+        self.up_q = queue.Queue(maxsize=128)
+        self._closed = False
+        self._write_closed = False
+        self._resources_closed = False
+        self._close_notified = False
+        self._initial = bytes(initial)
+        self._down_thread = threading.Thread(
+            target=self._down_loop, name='poll-down-client', daemon=True)
+        self._up_thread = threading.Thread(
+            target=self._up_loop, name='poll-up-client', daemon=True)
+        self._down_thread.start()
+        self._up_thread.start()
+
+    def fileno(self):
+        return self._in.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._in, name)
+
+    def send(self, data):
+        if not data:
+            return 0
+        if self._closed or self._write_closed:
+            raise OSError('poll tunnel is closed')
+        try:
+            self.up_q.put(bytes(data), timeout=30)
+        except queue.Full:
+            raise OSError('poll send queue is full')
+        return len(data)
+
+    def sendall(self, data):
+        self.send(data)
+
+    def shutdown(self, how):
+        if how in (socket.SHUT_WR, socket.SHUT_RDWR):
+            if not self._write_closed:
+                self._write_closed = True
+                try:
+                    self.up_q.put_nowait(None)
+                except queue.Full:
+                    pass
+        if how in (socket.SHUT_RD, socket.SHUT_RDWR):
+            try:
+                self._in.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
+
+    def close(self):
+        if self._closed and self._resources_closed:
+            return
+        self._closed = True
+        if not self._close_notified:
+            self._close_notified = True
+            # Tell the controller immediately instead of leaving its reader
+            # (and its session slot) waiting for the 45s GC timeout.
+            threading.Thread(target=self._notify_close,
+                             name='poll-close', daemon=True).start()
+        try:
+            self.up_q.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._resources_closed:
+            return
+        self._resources_closed = True
+        for sock in (self._in, self._out):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _path(self, endpoint, extra):
+        query = 'session={}'.format(quote(self.session_id, safe=''))
+        if extra:
+            query += '&' + extra
+        return '/poll/{}?{}'.format(endpoint, query)
+
+    def _notify_close(self):
+        extra = 'close=1&role={}'.format(quote(self.role, safe=''))
+        if self.token:
+            extra += '&token={}'.format(quote(self.token, safe=''))
+        try:
+            _poll_request(self.host, self.port, self.use_tls, 'POST',
+                          self._path('up', extra), body=b'', timeout=2.0)
+        except Exception:
+            pass
+
+    def _headers(self):
+        lines = [
+            'X-CMon-Session: {}'.format(self.session_id),
+            'X-CMon-Role: {}'.format(self.role),
+        ]
+        if self.token:
+            lines.append('X-CMon-Token: {}'.format(self.token))
+        return lines
+
+    def _write_local(self, data):
+        view = memoryview(data)
+        while view:
+            try:
+                sent = self._out.send(view)
+            except (socket.timeout, TimeoutError):
+                if self._closed:
+                    raise ConnectionError('poll tunnel closed')
+                continue
+            if sent <= 0:
+                raise ConnectionError('poll tunnel closed')
+            view = view[sent:]
+
+    def _down_loop(self):
+        try:
+            pending = self._initial
+            if pending:
+                self._write_local(pending)
+                self.down_pos += len(pending)
+            while not self._closed:
+                extra = 'ack={}&wait={}&role={}'.format(
+                    self.down_pos, int(POLL_WAIT),
+                    quote(self.role, safe=''))
+                # Token in the query is the most proxy-portable form; the
+                # controller also accepts the X-CMon-Token header.
+                if self.token:
+                    extra += '&token={}'.format(quote(self.token, safe=''))
+                path = self._path('down', extra)
+                code, headers, body = _poll_request(
+                    self.host, self.port, self.use_tls, 'GET', path,
+                    timeout=POLL_WAIT + 17)
+                if code != 200:
+                    if code in (404, 409, 410):
+                        break
+                    raise OSError('poll down returned HTTP {}'.format(code))
+                if body:
+                    self._write_local(body)
+                    self.down_pos += len(body)
+                if headers.get('x-cmon-poll-close'):
+                    break
+        except (OSError, ValueError, ConnectionError):
+            pass
+        finally:
+            try:
+                self._out.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def _up_loop(self):
+        try:
+            while not self._closed:
+                try:
+                    first = self.up_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if first is None:
+                    break
+                batch = bytearray(first)
+                while len(batch) < POLL_BATCH:
+                    try:
+                        more = self.up_q.get_nowait()
+                    except queue.Empty:
+                        if len(batch) < 64 * 1024:
+                            time.sleep(0.005)
+                            try:
+                                more = self.up_q.get_nowait()
+                            except queue.Empty:
+                                break
+                        else:
+                            break
+                    if more is None:
+                        break
+                    batch += more
+                if not batch:
+                    continue
+                self.up_seq += 1
+                sequence = self.up_seq
+                path = self._path(
+                    'up', 'seq={}&role={}'.format(
+                        sequence, quote(self.role, safe='')))
+                if self.token:
+                    path += '&token={}'.format(quote(self.token, safe=''))
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        code, _headers, _body = _poll_request(
+                            self.host, self.port, self.use_tls, 'POST', path,
+                            body=bytes(batch), timeout=POLL_TIMEOUT)
+                        if code == 200:
+                            last_error = None
+                            break
+                        last_error = 'HTTP {}'.format(code)
+                        if code in (403, 404, 409, 410):
+                            raise OSError('poll upload rejected ({})'.format(
+                                last_error))
+                    except (OSError, ValueError) as e:
+                        last_error = e
+                    if self._closed:
+                        break
+                    time.sleep(0.2 * (attempt + 1))
+                if last_error is not None:
+                    print('[!] poll upload stopped: {}'.format(last_error))
+                    break
+        except (OSError, ValueError) as e:
+            if not self._closed:
+                print('[!] poll upload stopped: {}'.format(e))
+        finally:
+            try:
+                self._out.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+
+def _poll_connect(host, port, use_tls=True, role='control', token=None):
+    """Create one long-poll session and return its socket-shaped adapter."""
+    sid = token if role == 'shell' and token else secrets.token_urlsafe(24)
+    path = '/poll/down?session={}&ack=0&wait=0&role={}'.format(
+        quote(sid, safe=''), quote(role, safe=''))
+    if token:
+        path += '&token={}'.format(quote(token, safe=''))
+    code, _headers, initial = _poll_request(
+        host, port, use_tls, 'GET', path, timeout=HTTP_HANDSHAKE_TIMEOUT + 5)
+    if code != 200:
+        raise TransportNotSupported(
+            'poll session returned HTTP {}'.format(code))
+    return PollTunnelClient(host, port, use_tls, sid, role=role, token=token,
+                            initial=initial)
 
 
 def _half_connect(host, port, use_tls=True, role='control', token=None):
@@ -4545,7 +6841,11 @@ def _recv_hello_ack(sock, timeout=TUNNEL_PROBE_TIMEOUT):
         pass
     try:
         send_msg(sock, {'type': 'hello', 'env': environment_report()})
-        msg = recv_msg(sock)
+        # recv_msg() uses select() for its stall timeout, which does not see
+        # the Python socket timeout set above.  Pass an absolute deadline so a
+        # buffering proxy fails over to the next transport in ~12 s instead of
+        # waiting for the generic 300 s stall timeout.
+        msg = recv_msg(sock, deadline=time.time() + timeout)
         if not isinstance(msg, dict) or msg.get('type') != 'hello_ack':
             raise TransportNotSupported(
                 'controller did not acknowledge the tunnel handshake')
@@ -4575,7 +6875,8 @@ def _open_controller_connection(host, port, scheme='auto', role='control',
     errors = []
     for family in candidates:
         # Within one HTTP(S) family, try WebSocket first (best through
-        # tunnels), then the streaming POST, then the half-duplex fallback.
+        # tunnels), then the streaming POST, then the half-duplex fallback,
+        # and finally long polling for proxies that buffer whole responses.
         if family in ('http', 'https'):
             use_tls = family == 'https'
             variants = []
@@ -4592,6 +6893,10 @@ def _open_controller_connection(host, port, scheme='auto', role='control',
             if (os.environ.get('CMON_DISABLE_HALF') or '').strip() not in ('1', 'true', 'yes'):
                 variants.append(
                     ('http-half', lambda: _half_connect(
+                        host, port, use_tls=use_tls, role=role, token=token)))
+            if (os.environ.get('CMON_DISABLE_POLL') or '').strip() not in ('1', 'true', 'yes'):
+                variants.append(
+                    ('http-poll', lambda: _poll_connect(
                         host, port, use_tls=use_tls, role=role, token=token)))
             cached_variant = _cached_transport(key)
             if cached_variant:
@@ -4668,6 +6973,7 @@ def _raw_handshake(sock, role, token=None):
 
 
 def main():
+    _silence_console()           # the client must never print to its console
     _harden_console()            # a hostile/odd name must never kill printing
     _immune_to_ctrl_c()          # Ctrl+C is never a way to stop this client
     _windows_dpi_aware()         # correct screenshot pixels on scaled displays
@@ -4810,7 +7116,11 @@ def main():
 
                 # The controller stopped this request (Ctrl+Z / 'stop') before we
                 # got to it: answer and move on instead of running it.
-                if mtype not in ('exit', 'hello', 'cancel', 'cmd_kill', 'screenshare_stop') \
+                if mtype not in ('exit', 'hello', 'cancel', 'cmd_kill',
+                                 'screenshare_stop', 'transfer_begin',
+                                 'transfer_entries', 'transfer_file_begin',
+                                 'transfer_chunk', 'transfer_file_end',
+                                 'transfer_abort', 'transfer_end') \
                         and _is_canceled(req_id):
                     why = _forget_canceled(req_id) or 'Ctrl+Z'
                     send_msg(client_socket, {'type': 'output', 'id': req_id,
@@ -4863,34 +7173,30 @@ def main():
                     continue
 
                 if mtype in ('cmd_kill', 'cancel'):
-                    continue                # nothing running: nothing to stop
+                    if mtype == 'cancel':
+                        key = _incoming_key(req_id)
+                        state = INCOMING_TRANSFERS.get(key) if key is not None else None
+                        if state is not None:
+                            # Keep consuming until transfer_end so the byte
+                            # stream stays aligned, but discard the open file.
+                            state.abort({'reason': msg.get('why') or
+                                         'canceled by the controller'})
+                        # A download runs in its own worker so this message
+                        # can stop it before another chunk is sent.
+                        _outgoing_cancel(req_id)
+                    continue                # nothing else running: nothing to stop
 
                 if mtype == 'download':
-                    raw_path = msg.get('path', '')
-                    if not isinstance(raw_path, str):
-                        send_msg(client_socket, {'type': 'error', 'id': req_id,
-                                                 'data': 'download: path must be text'})
-                        continue
-                    path = os.path.expanduser(raw_path)
-                    real_path = path if os.path.isabs(path) else os.path.join(current_dir, path)
-                    try:
-                        info = os.stat(real_path)
-                        if not stat.S_ISREG(info.st_mode):
-                            raise OSError('not a regular file')
-                        if info.st_size > MAX_FILE:
-                            send_msg(client_socket, {'type': 'error', 'id': req_id, 'data': 'File too large (max {} MB)'.format(MAX_FILE // (1024 * 1024))})
-                            continue
-                        with open(real_path, 'rb') as f:
-                            # Bounded even if the file grows while we read it
-                            # (a 50 MB cap used to be checked only before opening).
-                            raw = f.read(MAX_FILE + 1)
-                        if len(raw) > MAX_FILE:
-                            send_msg(client_socket, {'type': 'error', 'id': req_id, 'data': 'File too large (max {} MB)'.format(MAX_FILE // (1024 * 1024))})
-                            continue
-                        data = base64.b64encode(raw).decode('ascii')
-                        send_msg(client_socket, {'type': 'file', 'id': req_id, 'name': os.path.basename(real_path), 'data': data})
-                    except Exception as e:
-                        send_msg(client_socket, {'type': 'error', 'id': req_id, 'data': 'download failed: {}'.format(e)})
+                    _serve_download_request(client_socket, msg, req_id,
+                                            current_dir)
+                    continue
+
+                if mtype in ('transfer_begin', 'transfer_entries',
+                             'transfer_file_begin', 'transfer_chunk',
+                             'transfer_file_end', 'transfer_abort',
+                             'transfer_end'):
+                    _handle_transfer_message(client_socket, msg, req_id,
+                                             current_dir)
                     continue
 
                 if mtype == 'upload':
@@ -4916,13 +7222,13 @@ def main():
                         if not isinstance(encoded, str):
                             raise ValueError('upload data is not text')
                         decoded_size = (len(encoded) * 3) // 4
-                        if decoded_size > MAX_FILE + 3:
-                            raise ValueError('File too large (max {} MB)'.format(
-                                MAX_FILE // (1024 * 1024)))
+                        if decoded_size > MAX_MSG:
+                            raise ValueError('legacy upload exceeds one protocol '
+                                             'message; use the streamed transfer')
                         data = base64.b64decode(encoded, validate=True)
-                        if len(data) > MAX_FILE:
-                            raise ValueError('File too large (max {} MB)'.format(
-                                MAX_FILE // (1024 * 1024)))
+                        if len(data) > MAX_MSG:
+                            raise ValueError('legacy upload exceeds one protocol '
+                                             'message; use the streamed transfer')
                         fd, tmp_path = tempfile.mkstemp(prefix='.upload-', dir=current_dir)
                         try:
                             with os.fdopen(fd, 'wb') as f:
@@ -5017,6 +7323,8 @@ def main():
 
         stop_stream(wait=0.5)                   # a share cannot outlive its socket
         stop_shell()                            # ... and neither can an old shell
+        _abort_outgoing_transfers()             # stop download workers
+        _abort_incoming_transfers()             # remove unfinished partial files
         try:
             client_socket.shutdown(socket.SHUT_RDWR)   # wakes a parked send/recv
         except OSError:
@@ -5035,6 +7343,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Zero console output is a hard rule, even for fatal startup errors.
+    _silence_console()
     # Ctrl+C must never end this client: keep running (and keep trying to
     # reach the controller) no matter how often it is pressed.
     _immune_to_ctrl_c()
