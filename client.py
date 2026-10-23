@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://jkzac-103-230-105-43.run.pinggy-free.link'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
@@ -1829,6 +1829,110 @@ if not state['ok']:
 raise SystemExit(0)
 '''
 
+# Persistent variant used for streaming: one Python process, one D-Bus
+# connection, and one portal call per line read from stdin.  Starting a new
+# Python/portal process for every frame cost ~70 ms on KDE; this keeps the
+# capture path fast without showing Spectacle's per-shot notification.
+PORTAL_STREAM_SCRIPT = r"""
+import os
+import sys
+
+try:
+    from gi.repository import Gio, GLib
+except Exception as exc:
+    sys.stderr.write('PyGObject (gi) is not available: %s' % exc)
+    raise SystemExit(3)
+
+try:
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+except Exception as exc:
+    sys.stderr.write('cannot open the session bus: %s' % exc)
+    raise SystemExit(3)
+
+unique = (bus.get_unique_name() or '').lstrip(':').replace('.', '_')
+state = {'expected': '', 'done': True, 'ok': False, 'error': '',
+         'uri': '', 'loop': None, 'timer': 0}
+
+
+def finish(ok, text='', uri=''):
+    if state['done']:
+        return
+    state['done'] = True
+    state['ok'] = ok
+    state['error'] = text
+    state['uri'] = uri
+    if state['loop'] is not None:
+        state['loop'].quit()
+
+
+def on_response(conn, sender, path, iface, signal_name, params):
+    if path != state['expected'] or state['done']:
+        return
+    try:
+        response, results = params.unpack()
+    except Exception as exc:
+        finish(False, 'bad portal response: %s' % exc)
+        return
+    if response != 0:
+        finish(False, 'screenshot request refused (portal response %s)' % response)
+        return
+    uri = results.get('uri') if isinstance(results, dict) else None
+    if hasattr(uri, 'unpack'):
+        uri = uri.unpack()
+    if not uri:
+        finish(False, 'the portal returned no screenshot file')
+        return
+    finish(True, uri=str(uri))
+
+
+def on_timeout():
+    finish(False, 'the desktop portal did not answer within 25s')
+    return False
+
+
+bus.signal_subscribe('org.freedesktop.portal.Desktop',
+                     'org.freedesktop.portal.Request', 'Response',
+                     None, None, Gio.DBusSignalFlags.NONE, on_response)
+
+counter = 0
+for line in sys.stdin:
+    if line.strip().lower() != 'shot':
+        continue
+    counter += 1
+    token = 'cmonshot%d_%d' % (os.getpid(), counter)
+    state.update(expected='/org/freedesktop/portal/desktop/request/%s/%s'
+                 % (unique, token), done=False, ok=False, error='', uri='')
+    state['loop'] = GLib.MainLoop()
+    state['timer'] = GLib.timeout_add_seconds(25, on_timeout)
+    options = {'handle_token': GLib.Variant('s', token),
+               'interactive': GLib.Variant('b', False)}
+    try:
+        bus.call_sync('org.freedesktop.portal.Desktop',
+                      '/org/freedesktop/portal/desktop',
+                      'org.freedesktop.portal.Screenshot', 'Screenshot',
+                      GLib.Variant('(sa{sv})', ('', options)),
+                      GLib.VariantType('(o)'), Gio.DBusCallFlags.NONE,
+                      10000, None)
+    except Exception as exc:
+        finish(False, 'portal call failed: %s' % exc)
+    if not state['done']:
+        state['loop'].run()
+    if state['timer']:
+        try:
+            GLib.source_remove(state['timer'])
+        except Exception:
+            pass
+        state['timer'] = 0
+    if state['ok']:
+        sys.stdout.write('OK %s\n' % state['uri'])
+    else:
+        sys.stdout.write('ERR %s\n' % (state['error'] or
+                                       'portal screenshot failed'))
+    sys.stdout.flush()
+raise SystemExit(0)
+"""
+
+
 _GI_PYTHON = [False]        # False = not probed yet, '' = none found, else a path
 
 
@@ -1856,6 +1960,96 @@ def _python_with_gi():
             break
     _GI_PYTHON[0] = found
     return found or None
+
+
+# KDE's screenshot portal is fast (~0.1s) and silent.  Keep its Python/D-Bus
+# helper alive instead of starting a new interpreter for every stream frame.
+# The helper exits on EOF, so it cannot outlive a client that is killed.
+_PORTAL_HELPER = {'proc': None, 'lock': threading.Lock(),
+                  'failed_until': 0.0}
+
+
+def _stop_portal_helper_locked():
+    proc = _PORTAL_HELPER['proc']
+    _PORTAL_HELPER['proc'] = None
+    if proc is None:
+        return
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1.0)
+        return
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _stop_portal_helper():
+    with _PORTAL_HELPER['lock']:
+        _stop_portal_helper_locked()
+
+
+atexit.register(_stop_portal_helper)
+
+
+def _portal_helper_uri():
+    """Ask the persistent portal helper for one screenshot URI.
+
+    The helper never opens a window and does not use Spectacle's notification
+    path.  A fresh helper is started only when the previous one has died.
+    """
+    if time.time() < _PORTAL_HELPER['failed_until']:
+        raise RuntimeError('the desktop portal is temporarily disabled after '
+                           'a failed request')
+    exe = _python_with_gi()
+    if not exe:
+        _PORTAL_HELPER['failed_until'] = time.time() + 30.0
+        raise RuntimeError('needs PyGObject (install python3-gi / '
+                           'python3-gobject, or use an X11 session)')
+    with _PORTAL_HELPER['lock']:
+        proc = _PORTAL_HELPER['proc']
+        if proc is None or proc.poll() is not None:
+            _stop_portal_helper_locked()
+            try:
+                proc = subprocess.Popen(
+                    [exe, '-u', '-c', PORTAL_STREAM_SCRIPT],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError as exc:
+                raise RuntimeError('cannot start the portal helper: %s' % exc)
+            _PORTAL_HELPER['proc'] = proc
+        try:
+            proc.stdin.write(b'shot\n')
+            proc.stdin.flush()
+        except OSError as exc:
+            _stop_portal_helper_locked()
+            raise RuntimeError('the portal helper is not accepting requests: %s' % exc)
+        line = proc.stdout.readline()
+        if not line:
+            _stop_portal_helper_locked()
+            _PORTAL_HELPER['failed_until'] = time.time() + 30.0
+            raise RuntimeError('the portal helper exited without a picture')
+        text = line.decode('utf-8', 'replace').strip()
+        if text.startswith('OK '):
+            uri = text[3:].strip()
+            if uri:
+                _PORTAL_HELPER['failed_until'] = 0.0
+                return uri
+        _stop_portal_helper_locked()
+        _PORTAL_HELPER['failed_until'] = time.time() + 30.0
+        raise RuntimeError(text[4:].strip() if text.startswith('ERR ') else
+                           'bad portal helper reply: %s' % text[:200])
+
 
 
 _HYPR_LAYOUT = {'stamp': 0.0, 'box': None}
@@ -2135,10 +2329,33 @@ def _cursor_hotspot(image_size):
 
 
 _CAPTURE_HAS_CURSOR = False
+_PORTAL_CAPTURE_LOCK = threading.Lock()
 
 
-def _draw_cursor_overlay(img):
-    """Draw a high-contrast pointer so screen shares show mouse movement."""
+def _fit_screen(img, max_size=SCREEN_SIZE):
+    """Downscale a capture without distorting its aspect ratio."""
+    try:
+        from PIL import Image
+        if img.width > max_size[0] or img.height > max_size[1]:
+            img = img.copy()
+            img.thumbnail(max_size, Image.Resampling.BILINEAR)
+    except Exception:
+        # A very old Pillow has no Resampling enum; the LANCZOS name works.
+        try:
+            from PIL import Image
+            img = img.copy()
+            img.thumbnail(max_size, Image.LANCZOS)
+        except Exception:
+            pass
+    return img
+
+
+def _draw_cursor_overlay(img, position=None):
+    """Draw a high-contrast pointer so screen shares show mouse movement.
+
+    `position` may be sampled before a slow capture so the pointer is drawn
+    where it was when the frame was taken, not where it moved during capture.
+    """
     if _CAPTURE_HAS_CURSOR:
         # screencapture -C, GNOME Shell and Spectacle -p already painted the
         # pointer; drawing ours too would show two cursors.  grim -c and the
@@ -2146,7 +2363,8 @@ def _draw_cursor_overlay(img):
         # flag), so those capture paths leave this False and are overlaid.
         return img
     try:
-        position = _cursor_hotspot(img.size)
+        if position is None:
+            position = _cursor_hotspot(img.size)
         if position is None:
             return img
         from PIL import Image, ImageDraw
@@ -2156,7 +2374,7 @@ def _draw_cursor_overlay(img):
         # A small, recognisable arrow.  Keep it inside the frame at the edges
         # (the hotspot still points at the real cursor position).  Scale it a
         # little on very large captures so it stays visible in a thumbnail.
-        scale = max(1.0, min(img.width / 1366.0, 2.0))
+        scale = max(0.7, min(img.width / 1366.0, 1.6))
         x = min(max(0, int(round(x))), max(0, img.width - 2))
         y = min(max(0, int(round(y))), max(0, img.height - 2))
         points = [(x, y),
@@ -2176,7 +2394,7 @@ def _draw_cursor_overlay(img):
     return img
 
 
-def grab_screen():
+def grab_screen(fast=False):
     """Take one screenshot from wherever this client runs.
 
     Fast and silent paths first: Pillow's ImageGrab on Windows/macOS/X11
@@ -2295,23 +2513,7 @@ def grab_screen():
     def from_portal():
         """GNOME/Wayland via the XDG desktop portal (the supported path;
         PyGObject is needed, run through whichever Python has it)."""
-        exe = _python_with_gi()
-        if not exe:
-            raise RuntimeError('needs PyGObject (install python3-gi / '
-                               'python3-gobject, or use an X11 session)')
-        try:
-            proc = subprocess.run([exe, '-c', PORTAL_SCREENSHOT_SCRIPT, '0'],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  timeout=40)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError('the desktop portal did not answer within 40s '
-                               '(if a one-time "Allow screenshots?" dialog is '
-                               'waiting, accept it and retry)')
-        if proc.returncode != 0:
-            detail = proc.stderr.decode('utf-8', 'replace').strip()
-            raise RuntimeError(detail.splitlines()[-1] if detail else
-                               'portal exit status {}'.format(proc.returncode))
-        uri = proc.stdout.decode('utf-8', 'replace').strip()
+        uri = _portal_helper_uri()
         if not uri.startswith('file://'):
             raise RuntimeError('the portal returned no file')
         from urllib.parse import unquote, urlparse
@@ -2402,10 +2604,23 @@ def grab_screen():
             from PIL import ImageGrab
             if sys.platform == 'win32':
                 try:
-                    # Every monitor plus layered windows; plain grab() only
-                    # sees the primary screen.
-                    img = ImageGrab.grab(all_screens=True,
-                                         include_layered_windows=True)
+                    # Streams use the cheaper capture (layered-window capture
+                    # adds a per-window pass and made large displays sluggish).
+                    # One-shot screenshots still include layered windows.
+                    # A single-monitor VM must not pay for all_screens either.
+                    if fast:
+                        try:
+                            import ctypes
+                            monitors = ctypes.windll.user32.GetSystemMetrics(80)  # SM_CMONITORS
+                        except Exception:
+                            monitors = 1
+                        if monitors > 1:
+                            img = ImageGrab.grab(all_screens=True)
+                        else:
+                            img = ImageGrab.grab()
+                    else:
+                        img = ImageGrab.grab(all_screens=True,
+                                             include_layered_windows=True)
                 except TypeError:       # Pillow < 6.2 has no such options
                     img = ImageGrab.grab()
             else:
@@ -2421,9 +2636,17 @@ def grab_screen():
         elif name == 'android':
             return from_android()
         elif name == 'portal':
-            # The portal never promises a pointer; draw our own when the
-            # compositor exposes a cursor position.
-            return from_portal()
+            # Serialize portal captures: KDE writes a second-resolution file
+            # name, so two concurrent frames could otherwise overwrite the
+            # file between the reply and the read.  KDE's non-interactive
+            # portal path is silent and includes the pointer by default.
+            with _PORTAL_CAPTURE_LOCK:
+                img = from_portal()
+            if 'kde' in desktop or 'plasma' in desktop:
+                # KDE's screenshot dialog defaults to "include pointer"; do
+                # not paint a second cursor over the one already in the frame.
+                _CAPTURE_HAS_CURSOR = True
+            return img
         elif name == 'gnome_shell':
             img = from_gnome_shell()
             _CAPTURE_HAS_CURSOR = True
@@ -2453,7 +2676,7 @@ def grab_screen():
         # not tried here at all: a clear error with instructions is better
         # than a screenshot that silently shows the wrong thing.
         if 'kde' in desktop or 'plasma' in desktop:
-            order = ['spectacle', 'portal', 'grim']
+            order = ['portal', 'spectacle', 'grim']
         elif 'gnome' in desktop:
             order = ['portal', 'gnome_shell', 'grim']
         else:                        # Hyprland, Sway, ...
@@ -2539,14 +2762,35 @@ def stream_screen(conn, fps=None, stop_event=None, req_id=None):
             interval = None
 
     failed = False
+    last_size = None
+    # Large frames on a limited tunnel used to make motion crawl.  Start at
+    # the normal size/quality, then step down only when the send itself is
+    # slow; recover gradually on a fast link.  Capture cost is deliberately
+    # not part of this decision (lower JPEG quality cannot speed up a grab).
+    sizes = [SCREEN_SIZE, (854, 480), (768, 432), (640, 360)]
+    size_index = 0
+    quality = SCREEN_JPEG_QUALITY
+    slow_frames = 0
+    fast_frames = 0
+    target_interval = interval if interval else 1.0 / 12.0
+    slow_threshold = max(0.12, target_interval * 0.8)
     while stop_event is None or not stop_event.is_set():
         start = time.time()
         try:
-            img = grab_screen()
-            img = img.resize(SCREEN_SIZE)                 # PIL resize: (width, height)
-            img = _draw_cursor_overlay(img)
+            # Sample the pointer before a slow grab so the arrow belongs to
+            # this frame rather than jumping ahead while the capture runs.
+            pointer = None
+            if last_size is not None:
+                pointer = _cursor_hotspot(last_size)
+            img = grab_screen(fast=True)
+            img = _fit_screen(img, sizes[size_index])
+            if pointer is not None and last_size:
+                pointer = (pointer[0] * img.width / float(last_size[0]),
+                           pointer[1] * img.height / float(last_size[1]))
+            img = _draw_cursor_overlay(img, pointer)
+            last_size = img.size
             buf = io.BytesIO()
-            img.save(buf, 'JPEG', quality=SCREEN_JPEG_QUALITY)
+            img.save(buf, 'JPEG', quality=quality)
         except Exception as e:
             send_msg(conn, {'type': 'error', 'id': req_id,
                             'data': 'screenshot failed: {}'.format(e),
@@ -2554,7 +2798,27 @@ def stream_screen(conn, fps=None, stop_event=None, req_id=None):
             failed = True
             break
 
+        send_start = time.time()
         _send_frame(conn, buf.getvalue())                 # OSError -> reconnect
+        send_elapsed = time.time() - send_start
+        if send_elapsed > slow_threshold:
+            fast_frames = 0
+            slow_frames += 1
+            if slow_frames >= 2:
+                slow_frames = 0
+                if quality > 50:
+                    quality = max(50, quality - 6)
+                elif size_index + 1 < len(sizes):
+                    size_index += 1
+        elif send_elapsed < min(0.08, slow_threshold * 0.55):
+            slow_frames = 0
+            fast_frames += 1
+            if fast_frames >= 12:
+                fast_frames = 0
+                if quality < SCREEN_JPEG_QUALITY:
+                    quality = min(SCREEN_JPEG_QUALITY, quality + 3)
+                elif size_index > 0:
+                    size_index -= 1
 
         if interval:
             elapsed = time.time() - start
