@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://ithpu-103-230-106-21.free.pinggy.net'
+DEFAULT_IP = '192.168.0.113'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
@@ -2026,6 +2026,7 @@ def _portal_helper_uri():
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL, start_new_session=True)
             except OSError as exc:
+                _PORTAL_HELPER['failed_until'] = time.time() + 30.0
                 raise RuntimeError('cannot start the portal helper: %s' % exc)
             _PORTAL_HELPER['proc'] = proc
         try:
@@ -2033,7 +2034,17 @@ def _portal_helper_uri():
             proc.stdin.flush()
         except OSError as exc:
             _stop_portal_helper_locked()
+            _PORTAL_HELPER['failed_until'] = time.time() + 30.0
             raise RuntimeError('the portal helper is not accepting requests: %s' % exc)
+        # Do not let a stuck portal freeze a screenshot/screen share forever.
+        try:
+            ready, _, _ = select.select([proc.stdout], [], [], 30.0)
+        except (OSError, ValueError):
+            ready = []
+        if not ready:
+            _stop_portal_helper_locked()
+            _PORTAL_HELPER['failed_until'] = time.time() + 30.0
+            raise RuntimeError('the desktop portal did not answer within 30s')
         line = proc.stdout.readline()
         if not line:
             _stop_portal_helper_locked()
@@ -2638,14 +2649,12 @@ def grab_screen(fast=False):
         elif name == 'portal':
             # Serialize portal captures: KDE writes a second-resolution file
             # name, so two concurrent frames could otherwise overwrite the
-            # file between the reply and the read.  KDE's non-interactive
-            # portal path is silent and includes the pointer by default.
+            # file between the reply and the read.  The non-interactive
+            # portal path is silent; unlike Spectacle -p it does not reliably
+            # include the pointer, so _CAPTURE_HAS_CURSOR stays False and the
+            # live pointer is painted from the compositor/OS position.
             with _PORTAL_CAPTURE_LOCK:
                 img = from_portal()
-            if 'kde' in desktop or 'plasma' in desktop:
-                # KDE's screenshot dialog defaults to "include pointer"; do
-                # not paint a second cursor over the one already in the frame.
-                _CAPTURE_HAS_CURSOR = True
             return img
         elif name == 'gnome_shell':
             img = from_gnome_shell()

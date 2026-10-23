@@ -2325,9 +2325,9 @@ every few seconds used to hold the only accept thread for minutes."""
         try:
             readable, _, _ = select.select([conn], [], [], timeout)
         except OSError:
-            return None if require else {}
+            return (None if require else {}), {}
         if conn not in readable:
-            return None if require else {}
+            return (None if require else {}), {}
     try:
         msg = recv_msg(conn, deadline=time.time() + max(10, timeout))
     except OSError:
@@ -2338,8 +2338,9 @@ every few seconds used to hold the only accept thread for minutes."""
         except OSError:
             pass
     if isinstance(msg, dict) and msg.get('type') == 'hello':
-        return _sanitize_env(msg.get('env') or {})
-    return None if require else {}
+        features = {'frame_ack': bool(msg.get('frame_ack'))}
+        return _sanitize_env(msg.get('env') or {}), features
+    return (None if require else {}), {}
 
 
 def _show_output(text, out=None):
@@ -3688,6 +3689,15 @@ Ctrl+Z cancels it on the client."""
         if not self.viewer_announced:
             self.viewer_announced = True
             self.link.say(_capture_text(announce_viewer, viewer, self.seconds))
+        if self.link.frame_ack:
+            # Tiny reverse-channel credit signal.  It lets the client keep at
+            # most a few frames in flight instead of queueing seconds of stale
+            # images when the tunnel is slow.
+            try:
+                self.link.send({'type': 'frame_ack', 'id': self.id,
+                                'seq': self.frames})
+            except OSError:
+                self.link.mark_lost()
         if viewer.stop_requested:           # the Stop button in the page
             self.ask_stop()
         elif self.seconds and (time.time() - self.stream_start) >= self.seconds:
@@ -3927,6 +3937,7 @@ the order their answers arrive in."""
         self.addr = addr
         self.number = None              # session number, assigned on accept
         self.env = {}                   # this client's hello (for 'session')
+        self.frame_ack = False          # new client + full-duplex transport
         self.on_dead = None             # registry hook: this session went away
         self.lock = threading.Lock()
         self.send_lock = threading.Lock()   # the reader thread can send too
@@ -6130,18 +6141,27 @@ def _looks_like_http(data):
                 b'CONNECT ', b'PATCH ', b'DELETE ', b'PRI '))
 
 
-def _finish_client_link(client_socket, addr, env, transport_label, new_protocol):
+def _finish_client_link(client_socket, addr, env, transport_label,
+                        new_protocol, features=None):
     """Create/register one control link after its hello has been read."""
     link = ClientLink(client_socket, addr)
     link.number = _next_session_number()
     link.env = env
     link.on_dead = _link_died
+    # Optional per-frame acknowledgements let a new client avoid filling a
+    # slow tunnel's buffers with stale screen frames.  Half-duplex and poll
+    # transports have no independent downlink during a stream, so they keep
+    # the older send-only behavior.  Old clients never advertise this.
+    link.frame_ack = bool((features or {}).get('frame_ack')) and            transport_label not in ('HTTP-half', 'HTTP-poll')
     if new_protocol:
         # This acknowledgement is the final end-to-end proof: it only reaches
         # the client after its hello arrived here.  A proxy that buffers
         # request bodies fails here and the client falls back to half-duplex.
-        link.send({'type': 'hello_ack', 'transport': transport_label,
-                   'version': CMON_VERSION})
+        ack = {'type': 'hello_ack', 'transport': transport_label,
+               'version': CMON_VERSION}
+        if link.frame_ack:
+            ack['frame_ack'] = True
+        link.send(ack)
     _async_print("[+] Client connected: {} [{}]".format(addr, transport_label))
     try:
         env_text = _capture_text(print_client_env, env)
@@ -6174,11 +6194,12 @@ def _finish_control_link(client_socket, addr, transport_label, new_protocol,
     requests needed by the client's half-duplex fallback (or a second client).
     """
     try:
-        env = read_hello(client_socket, timeout=timeout, require=new_protocol)
+        env, features = read_hello(client_socket, timeout=timeout,
+                                    require=new_protocol)
         if env is None:
             raise OSError('client did not complete the application hello')
         _finish_client_link(client_socket, addr, env, transport_label,
-                            new_protocol)
+                            new_protocol, features)
     except Exception as e:
         try:
             client_socket.close()
