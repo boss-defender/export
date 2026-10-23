@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://suxhu-103-55-145-173.free.pinggy.net'
+DEFAULT_IP = 'https://hmmcw-103-55-145-178.free.pinggy.net'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
