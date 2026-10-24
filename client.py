@@ -51,7 +51,7 @@ http = 'http'
 https = 'https'
 connection_type = auto         # <- auto / https / http / tcp
 
-DEFAULT_IP = 'https://uzvvc-182-252-93-205.free.pinggy.net'
+DEFAULT_IP = 'tcp://joilr-182-252-93-205.run.pinggy-free.link:36567'
 DEFAULT_PORT = 4444
 RETRY_DELAY = 1               # seconds between reconnect attempts
 CONNECT_TIMEOUT = 3           # seconds a TCP connect may take before we retry
